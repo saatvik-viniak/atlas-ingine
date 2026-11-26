@@ -21,6 +21,7 @@ instead of GLM.
 | Panel | Source |
 |---|---|
 | live slots, queue | `GET http://127.0.0.1:8090/health` |
+| live tokens (generated, max, started, first token) | `GET http://127.0.0.1:8090/stats` (new in this PR) |
 | finished requests | `journalctl --user -u ik2-serve.service -f -o cat` (the engine's `prefill=` and `completion=` lines) |
 | GPU load / VRAM / power / temp / PCIe | `nvidia-smi` for GPUs 2 and 3 |
 | CPU / RAM / disk | `/proc/stat`, `/proc/meminfo`, `/proc/diskstats` |
@@ -31,8 +32,8 @@ instead of GLM.
 - `chats.js` / `sidebar.js` are cut to the exports the Monitor uses (`newChat`, `setSide`, `status`).
 - `tokens.css` gains an `html[data-scheme="ik2"]` block: deep green-black page, teal accent, amber warnings.
 - `monitor.js`: the subtitle and the Context note mention IK2; the VRAM-hit stat (not exposed by
-  ingine-serve) is removed; while the engine writes, the Decode figure shows the last finished
-  request's rate and is labelled **last request** (ingine-serve has no live token counter).
+  ingine-serve) is removed. With `/stats` the Decode figure is the live aggregate rate while the
+  engine writes; without it, the last finished request's rate is shown and labelled **last request**.
 - `index.html` is the dashboard's own shell; the theme is dark.
 
 ## Run

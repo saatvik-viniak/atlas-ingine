@@ -70,6 +70,10 @@ class Collector:
         self.lock = threading.Lock()
         self.since = time.time()
         self.health: dict = {}
+        self.stats: dict = {}
+        self.live_tok_s: float | None = None
+        self._prev_gen: int | None = None
+        self._prev_gen_t: float | None = None
         self.gpus: list[dict] = []
         self.cpu = 0.0
         self.ram_used = 0
@@ -162,12 +166,25 @@ class Collector:
         while True:
             t0 = time.time()
             h = http_json("/health") or {}
+            st = http_json("/stats") or {}
             gpus = self._gpus()
             cpu = self._cpu()
             ram_used, ram_total = self._ram()
             disk_read, disk_write = self._disk()
+            reqs = st.get("requests") or []
+            now = time.time()
+            if reqs:
+                gen = sum(int(r.get("generated") or 0) for r in reqs)
+                if self._prev_gen is not None and self._prev_gen_t is not None:
+                    dt = now - self._prev_gen_t
+                    dg = gen - self._prev_gen
+                    self.live_tok_s = (dg / dt) if dt > 0 and dg >= 0 else None
+                self._prev_gen, self._prev_gen_t = gen, now
+            else:
+                self.live_tok_s, self._prev_gen, self._prev_gen_t = None, None, None
             with self.lock:
                 self.health = h
+                self.stats = st
                 self.gpus = gpus
                 self.cpu = cpu
                 self.ram_used, self.ram_total = ram_used, ram_total
@@ -263,9 +280,10 @@ class Collector:
             return sum(v) if v else None
 
         last = self.requests[-1] if self.requests else None
-        # a finished request's rate is a spike at the second it landed, not a flat line for the next minute
+        # live aggregate while a request runs; a finished request's rate is a spike at the second it landed
         fresh = last is not None and time.time() - last["time"] <= 2
-        self.history["tok_s"].append(last["decode_tok_s"] if fresh else None)
+        live = self.live_tok_s if (self.stats.get("requests") or []) else None
+        self.history["tok_s"].append(live if live is not None else (last["decode_tok_s"] if fresh else None))
         self.history["prefill_tok_s_mean"].append(last.get("prefill_tok_s") if fresh else None)
         self.history["gpu_util"].append(avg("util"))
         self.history["gpu_mem_used"].append(total("mem_used"))
@@ -280,28 +298,36 @@ class Collector:
     def metrics(self, all_requests: bool = False) -> dict:
         with self.lock:
             h, gpus = dict(self.health), [dict(g) for g in self.gpus]
+            stats = dict(self.stats)
             reqs = list(self.requests)
             current = dict(self.current)
             totals = dict(self.totals)
             hist = {k: list(v) for k, v in self.history.items()}
             cpu, ram_used, ram_total = self.cpu, self.ram_used, self.ram_total
             disk_read, disk_write = self.disk_read_mb, self.disk_write_mb
-        active = int(h.get("active") or 0)
+        sreqs = stats.get("requests") or []
+        active = len(sreqs) or int(h.get("active") or 0)
         queued = int(h.get("waiting") or 0)
-        running = bool(h.get("running")) or active > 0
+        reading = bool(sreqs) and all(not r.get("first_token") and not (r.get("generated") or 0) for r in sreqs)
+        state = "reading" if reading else "generating" if active else "idle"
         now = time.time()
         cur = next(iter(current.values()), None)
         last = reqs[-1] if reqs else None
-        state = "generating" if running else "idle"
+        generated = sum(int(r.get("generated") or 0) for r in sreqs) if sreqs else None
+        max_tokens = sum(int(r.get("max_tokens") or 0) for r in sreqs) if sreqs else None
+        elapsed = max((float(r.get("elapsed_s") or 0) for r in sreqs), default=None) if sreqs else None
         live = {"state": state, "queued": queued, "active": active, "writing": active,
                 "spec_off": False, "phase": None,
-                "prompt_tokens": (cur or {}).get("prompt") if running and cur else (last or {}).get("prompt_tokens"),
+                "prompt_tokens": (sum(int(r.get("prompt_tokens") or 0) for r in sreqs) if sreqs
+                                  else (last or {}).get("prompt_tokens")),
                 "prompt_read": None, "prompt_total": None,
-                "generated": None, "max_tokens": None,
-                "elapsed_s": round(now - cur["time"], 1) if running and cur else None,
-                "tok_s": None, "tok_s_mean": None, "prefill_tok_s_mean": None,
-                "prompt_reused": (cur or {}).get("reused") if running and cur else (last or {}).get("reused"),
-                "tok_s_window_s": 1 if running else None}
+                "generated": generated, "max_tokens": max_tokens,
+                "elapsed_s": round(elapsed, 1) if elapsed is not None else None,
+                "tok_s": self.live_tok_s if state == "generating" else None,
+                "tok_s_mean": self.live_tok_s if state == "generating" else None,
+                "prefill_tok_s_mean": None,
+                "prompt_reused": (cur or {}).get("reused") if active and cur else (last or {}).get("reused"),
+                "tok_s_window_s": 1 if active else None}
         engine = {"model": "inkling-2-mini", "model_label": "Inkling-2-Mini UD-IQ4_XS + DSpark",
                   "max_context": MAX_CONTEXT, "images": False, "version": "atlas-ingine",
                   "engine_kind": "ik2", "speculation": ["DSpark"]}

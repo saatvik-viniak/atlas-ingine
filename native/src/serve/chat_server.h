@@ -15,10 +15,13 @@
 
 #include <httplib.h>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 namespace ingine::serve {
 
@@ -74,6 +77,19 @@ class ChatServer {
   Json supported_kv_cache_modes_json() const;
   Json personas_list() const;
 
+  // Live per-request counters behind GET /stats (the dashboard's live token counter).
+  struct LiveRequest {
+    int prompt_tokens = 0;
+    int max_tokens = 0;
+    int generated = 0;
+    bool first_token = false;
+    std::chrono::system_clock::time_point started;
+  };
+  void live_begin(const std::string& id, int prompt_tokens, int max_tokens);
+  void live_update(const std::string& id, int generated, bool first_token);
+  void live_end(const std::string& id, int generated);
+  Json live_stats();
+
   const text::ChatFormat& fmt_;
   const std::string model_id_;
   const std::string model_family_;
@@ -104,6 +120,11 @@ class ChatServer {
   const int64_t created_;
   engine::Scheduler scheduler_;
   httplib::Server server_;
+  mutable std::mutex live_mu_;
+  std::unordered_map<std::string, LiveRequest> live_;
+  long long live_requests_ = 0;
+  long long live_prompt_tokens_ = 0;
+  long long live_output_tokens_ = 0;
   int port_ = 0;
   std::thread thread_;
 };

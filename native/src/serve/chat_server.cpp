@@ -331,6 +331,55 @@ Json ChatServer::personas_list() const {
               {"data", std::move(data)}};
 }
 
+void ChatServer::live_begin(const std::string& id, int prompt_tokens, int max_tokens) {
+  std::lock_guard<std::mutex> lk(live_mu_);
+  LiveRequest r;
+  r.prompt_tokens = prompt_tokens;
+  r.max_tokens = max_tokens;
+  r.started = std::chrono::system_clock::now();
+  live_[id] = r;
+}
+
+void ChatServer::live_update(const std::string& id, int generated, bool first_token) {
+  std::lock_guard<std::mutex> lk(live_mu_);
+  auto it = live_.find(id);
+  if (it == live_.end()) return;
+  it->second.generated = generated;
+  it->second.first_token = first_token;
+}
+
+void ChatServer::live_end(const std::string& id, int generated) {
+  std::lock_guard<std::mutex> lk(live_mu_);
+  auto it = live_.find(id);
+  if (it == live_.end()) return;
+  ++live_requests_;
+  live_prompt_tokens_ += it->second.prompt_tokens;
+  live_output_tokens_ += generated;
+  live_.erase(it);
+}
+
+Json ChatServer::live_stats() {
+  std::lock_guard<std::mutex> lk(live_mu_);
+  const double now =
+      std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+  Json reqs = Json::array();
+  for (const auto& [id, r] : live_) {
+    const double started = std::chrono::duration<double>(r.started.time_since_epoch()).count();
+    reqs.push_back(Json{{"id", id},
+                        {"prompt_tokens", r.prompt_tokens},
+                        {"generated", r.generated},
+                        {"max_tokens", r.max_tokens},
+                        {"first_token", r.first_token},
+                        {"started", started},
+                        {"elapsed_s", now - started}});
+  }
+  return Json{{"now", now},
+              {"requests", std::move(reqs)},
+              {"totals", Json{{"requests", live_requests_},
+                              {"prompt_tokens", live_prompt_tokens_},
+                              {"output_tokens", live_output_tokens_}}}};
+}
+
 void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res) {
   const std::string path = route_path(req);
   if (path == "/health") {
@@ -341,6 +390,7 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
     Json health{{"status", "ok"},
                 {"model", model_id_},
                 {"model_family", model_family_},
+                {"max_context", max_model_len_},
                 {"kv_cache_mode", model::to_string(kv_cache_mode_)},
                 {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
                 {"kv_cache_mode_mutable", false},
@@ -377,6 +427,8 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
       if (pm.expected_tap_layer.has_value()) health["platos_key_tap_layer"] = *pm.expected_tap_layer;
     }
     send_json(res, 200, health);
+  } else if (path == "/stats") {
+    send_json(res, 200, live_stats());
   } else if (path == "/v1/models") {
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
     res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
@@ -562,10 +614,17 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
   }
   text::StreamParser parser = fmt_.parser(request.prefill_ids, request.stop);
   auto x = std::make_shared<Exchange>(std::move(job), std::move(parser), std::move(request));
+  live_begin(x->job->id, int(x->job->prompt_ids.size()), x->req.max_new_tokens);
 
   if (!x->req.stream) {
+    auto live_guard = std::shared_ptr<void>(static_cast<void*>(nullptr), [this, x](void*) {
+      live_end(x->job->id, x->parser.num_tokens());
+    });
     try {
-      pump(*x, [&req] { return req.is_connection_closed(); }, [](std::vector<text::Delta>&) {});
+      pump(*x, [&req] { return req.is_connection_closed(); },
+           [this, x](std::vector<text::Delta>&) {
+             live_update(x->job->id, x->parser.num_tokens(), x->t_first.has_value());
+           });
     } catch (const ClientDisconnected&) {
       scheduler_.withdraw(x->job);
       log_disconnected(*x);
@@ -635,6 +694,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
                  for (const text::Delta& d : text::merge_deltas(deltas)) {
                    transport.write(sse(dump(chunk(x, model_id_, delta_json(d), std::nullopt))));
                  }
+                 live_update(x.job->id, x.parser.num_tokens(), x.t_first.has_value());
                });
         } catch (const ClientDisconnected&) {
           scheduler_.withdraw(x.job);
@@ -667,6 +727,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
       },
       [this, state](bool success) {
         // The client left before or while streaming: the job must not keep (or start) generating.
+        live_end(state->x->job->id, state->x->parser.num_tokens());
         if (!success || !state->started.load(std::memory_order_acquire)) scheduler_.withdraw(state->x->job);
       });
 }
