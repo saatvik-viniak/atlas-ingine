@@ -18,6 +18,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -141,7 +142,7 @@ class Collector:
                 t["output_tokens"] += out
                 if prefill_s:
                     t["prompt_ms"] += prefill_s * 1000.0
-                t["decode_ms"] += (out / decode_tok_s * 1000.0) if decode_tok_s > 0 else 0.0
+                t["decode_ms"] += duration * 1000.0  # wall time, so cancelled answers do not inflate the total rate
                 if out >= 32 and (t["peak_decode"] is None or decode_tok_s > t["peak_decode"]["tok_s"]):
                     t["peak_decode"] = {"tok_s": decode_tok_s, "time": rec["time"], "tokens": out}
             return
@@ -160,6 +161,7 @@ class Collector:
                     self.requests.append(rec)
                     self.totals["requests"] += 1
                     self.totals["output_tokens"] += out
+                    self.totals["decode_ms"] += rec["duration_s"] * 1000.0
 
     # ---------------------------------------------------------------- hardware
     def sample(self) -> None:
@@ -392,6 +394,94 @@ class Collector:
 COL = Collector()
 
 
+# ---------------------------------------------------------------- electricity (the tracker Maya shipped)
+# The same daemon (energy-cost.py: live ComEd price x this machine's draw, SQLite) and the same summary Maya's
+# Settings > Usage showed.  Cached for 15 s; the script runs at most once per TTL.
+ENERGY_SCRIPT = Path(os.environ.get("IK2_ENERGY_SCRIPT", str(Path.home() / "Maya-data" / "tools" / "energy-cost.py")))
+ENERGY_TTL = 15.0
+ENERGY_TIMEOUT = 30.0
+ENERGY_DAYS = 400
+_energy_lock = threading.Lock()
+_energy = {"t": 0.0, "data": None, "err": None, "busy": False}
+
+
+def _er(v, n=4):
+    return None if v is None else round(float(v), n)
+
+
+def _eperiod(x):
+    if not x:
+        return None
+    return {"kwh": _er(x.get("kwh")), "usd": _er(x.get("cost_usd"), 6), "idle_kwh": _er(x.get("idle_kwh")),
+            "idle_usd": _er(x.get("idle_cost_usd"), 6), "active_kwh": _er(x.get("active_kwh")),
+            "active_usd": _er(x.get("active_cost_usd"), 6), "avg_w": _er(x.get("avg_w"), 1),
+            "peak_w": _er(x.get("peak_w"), 1)}
+
+
+def _esummarize(d):
+    now = d.get("now") or {}
+    month_key = time.strftime("%Y-%m")
+    months = d.get("months") or []
+    month = next((m for m in months if m.get("group") == month_key), None)
+    days = d.get("days") or []
+    tot = lambda k: sum(float(m.get(k) or 0) for m in months)
+    tracked_kwh, tracked_usd = tot("kwh"), tot("cost_usd")
+    first_day = min((x.get("group") for x in days if x.get("group")), default=None)
+    return {
+        "now": {"time": now.get("time"), "ac_w": _er(now.get("ac_w"), 1), "gpu_w": _er(now.get("gpu_w"), 1),
+                "gpu_each": [_er(w, 1) for w in (now.get("gpu_each") or [])], "cpu_w": _er(now.get("cpu_w"), 1),
+                "base_w": _er(now.get("base_w"), 1), "price_cents": _er(now.get("price_cents"), 2)},
+        "today": _eperiod(d.get("today")),
+        "month": {"name": month_key, **(_eperiod(month) or {"kwh": 0.0, "usd": 0.0})},
+        "days": [{"day": x.get("group"), "kwh": _er(x.get("kwh")), "usd": _er(x.get("cost_usd"), 6)} for x in days],
+        "tracked": {"kwh": round(tracked_kwh, 4), "usd": round(tracked_usd, 6), "since": first_day,
+                    "active_kwh": round(tot("active_kwh"), 4), "active_usd": round(tot("active_cost_usd"), 6),
+                    "idle_kwh": round(tot("idle_kwh"), 4), "idle_usd": round(tot("idle_cost_usd"), 6)},
+        "runs": [{"start": x.get("start_ts"), "end": x.get("end_ts"), "kwh": _er(x.get("kwh")),
+                  "usd": _er(x.get("cost_usd"), 6), "avg_w": _er(x.get("avg_w"), 1)} for x in (d.get("runs") or [])[:12]],
+    }
+
+
+def _energy_refresh(script: Path) -> None:
+    data, err = None, None
+    try:
+        out = subprocess.run([sys.executable or "python3", str(script), "json", "--days", str(ENERGY_DAYS)],
+                             capture_output=True, text=True, timeout=ENERGY_TIMEOUT)
+        if out.returncode == 0:
+            data = json.loads(out.stdout)
+        else:
+            err = ((out.stderr or "").strip().splitlines() or ["the tracker failed"])[-1][:300]
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        err = str(e)[:300]
+    with _energy_lock:
+        if data is not None:
+            _energy["data"], _energy["err"] = data, None
+        else:
+            _energy["err"] = err
+        _energy["t"] = time.time()
+        _energy["busy"] = False
+
+
+def energy_report() -> dict:
+    if not ENERGY_SCRIPT.is_file():
+        return {"available": False, "why": "no electricity tracker (energy-cost.py not found)"}
+    th = None
+    with _energy_lock:
+        if time.time() - _energy["t"] > ENERGY_TTL and not _energy["busy"]:
+            _energy["busy"] = True
+            th = threading.Thread(target=_energy_refresh, args=(ENERGY_SCRIPT,), daemon=True, name="energy")
+    if th is not None:
+        th.start()
+        if _energy["data"] is None:
+            th.join(ENERGY_TIMEOUT + 5)
+    with _energy_lock:
+        d, e, t = _energy["data"], _energy["err"], _energy["t"]
+    if d is None:
+        return {"available": False, "why": e or "reading the electricity tracker"}
+    return {"available": True, "age_s": round(time.time() - t, 1), "error": e, "script": str(ENERGY_SCRIPT),
+            **_esummarize(d)}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ik2-monitor/1"
 
@@ -425,6 +515,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/mcp":
             self._json({"servers": [], "tools": 0})
+            return
+        if path == "/api/energy":
+            self._json(energy_report())
             return
         if path == "/api/report":
             self._send(200, COL.report().encode(), "text/plain; charset=utf-8")

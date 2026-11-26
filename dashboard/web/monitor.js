@@ -7,6 +7,7 @@ import {fetchReport, reqAll, speculationView, tierShares} from "./server.js";
 import {newChat} from "./chats.js";
 import {setSide, status} from "./sidebar.js";
 import {Icon} from "./ui.js";
+import {Energy} from "./energy.js";
 
 // ------------------------------------------------------------------ a sparkline (nothing drawn when idle: all zeros)
 function sparkPath(values, max) {
@@ -619,6 +620,7 @@ export function MonitorPage() {
         <${Tiers} t=${m.tiers} eng=${m.engine || {}}/>
         <${GpuMap} m=${m}/>
         <${Hardware} m=${m} gpuEach=${gpuEach}/>
+        <${Energy}/>
         <${Requests} m=${m}/>`
       : html`<div class="card mon__wait">${S.conn === "down" ? "The server is not reachable. It may be starting, or stopped."
                                         : S.conn === "key" ? "This server needs its API key: add it in Settings › Connect your tools."
