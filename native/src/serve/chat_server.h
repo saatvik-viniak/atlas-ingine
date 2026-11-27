@@ -83,7 +83,8 @@ class ChatServer {
     int max_tokens = 0;
     int generated = 0;
     bool first_token = false;
-    std::chrono::system_clock::time_point started;
+    std::chrono::system_clock::time_point started;         // epoch, for the JSON
+    std::chrono::steady_clock::time_point started_steady;   // elapsed_s, immune to wall-clock jumps
   };
   void live_begin(const std::string& id, int prompt_tokens, int max_tokens);
   void live_update(const std::string& id, int generated, bool first_token);

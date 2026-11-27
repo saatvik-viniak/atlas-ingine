@@ -401,6 +401,50 @@ void test_models_and_health() {
   CHECK(s5->gen->calls().size() == 1);
 }
 
+Json stats(int port) { return Json::parse(request(port, "GET", "/stats").body); }
+
+// GET /stats: the live counters behind the dashboard (idle shape, an in-flight request, cleanup on disconnect).
+void test_stats() {
+  auto s = serve(long_text(), 0.002);
+  const int port = s->port();
+  Json idle = stats(port);
+  CHECK(idle["now"].is_number());
+  CHECK(idle["requests"].is_array() && idle["requests"].empty());
+  CHECK(idle["totals"]["requests"] == 0 && idle["totals"]["prompt_tokens"] == 0 &&
+        idle["totals"]["output_tokens"] == 0);
+  CHECK(health(port)["max_context"] == (1 << 20));
+
+  // one streaming answer in flight: generated advances, elapsed is non-negative, the prompt/max are known
+  const int sock = raw_request(port, {{"stream", true}, {"max_tokens", 2000}});
+  wait_for([&] {
+    Json j = stats(port);
+    return j["requests"].size() == 1 && j["requests"][0]["generated"].get<int>() > 0;
+  });
+  Json live = stats(port)["requests"][0];
+  CHECK(live["id"].is_string() && live["id"].get<std::string>().starts_with("chatcmpl-"));
+  CHECK(live["prompt_tokens"].get<int>() > 0 && live["max_tokens"] == 2000);
+  CHECK(live["first_token"] == true);
+  CHECK(live["generated"].get<int>() > 0 && live["generated"].get<int>() <= 2000);
+  CHECK(live["started"].is_number() && live["elapsed_s"].is_number() && live["elapsed_s"].get<double>() >= 0.0);
+  const int seen = live["generated"].get<int>();
+  wait_for([&] { return stats(port)["requests"][0]["generated"].get<int>() > seen; });
+
+  // the client leaves: the live entry is removed and the totals keep the request
+  ::close(sock);
+  wait_for([&] { return stats(port)["requests"].empty(); });
+  Json after = stats(port);
+  CHECK(after["totals"]["requests"] == 1);
+  CHECK(after["totals"]["prompt_tokens"].get<int>() > 0);
+  CHECK(after["totals"]["output_tokens"].get<int>() > 0);
+
+  // a second disconnect cleans up the same way
+  const int sock2 = raw_request(port, {{"stream", true}, {"max_tokens", 2000}});
+  wait_for([&] { return stats(port)["requests"].size() == 1; });
+  ::close(sock2);
+  wait_for([&] { return stats(port)["requests"].empty(); });
+  CHECK(stats(port)["totals"]["requests"] >= 2);
+}
+
 void test_non_streaming() {
   auto s = serve();
   Chat r = chat(s->port(), {{"model", "whatever"}});
@@ -2194,6 +2238,7 @@ int main() {
   g_fmt = &fmt;
   const std::vector<std::pair<std::string, std::function<void()>>> tests = {
       {"models_and_health", test_models_and_health},
+      {"stats", test_stats},
       {"non_streaming", test_non_streaming},
       {"streaming_matches_non_streaming[False]", [] { test_streaming_matches_non_streaming(false); }},
       {"streaming_matches_non_streaming[True]", [] { test_streaming_matches_non_streaming(true); }},

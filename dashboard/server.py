@@ -29,10 +29,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 ENGINE = os.environ.get("IK2_URL", "http://127.0.0.1:8090").rstrip("/")
 UNIT = os.environ.get("IK2_UNIT", "ik2-serve.service")
-GPU_IDS = {int(x) for x in os.environ.get("IK2_GPUS", "2,3").split(",") if x.strip()}
-HOST = os.environ.get("IK2_DASH_HOST", "0.0.0.0")
+# portability: all of these are opt-in; the defaults are host-neutral.
+GPU_FILTER = {int(x) for x in os.environ.get("IK2_GPUS", "").replace(" ", "").split(",") if x.strip()} or None
+HOST = os.environ.get("IK2_DASH_HOST", "127.0.0.1")
 PORT = int(os.environ.get("IK2_DASH_PORT", "8080"))
-MAX_CONTEXT = 262144
+MAX_CONTEXT_ENV = int(os.environ.get("IK2_MAX_CONTEXT", "0") or 0)
 HISTORY = 60
 
 PREFILL_RE = re.compile(
@@ -71,6 +72,7 @@ class Collector:
         self.lock = threading.Lock()
         self.since = time.time()
         self.health: dict = {}
+        self.max_context = MAX_CONTEXT_ENV or 262144   # replaced by the engine's /health max_context
         self.stats: dict = {}
         self.live_tok_s: float | None = None
         self._prev_gen: int | None = None
@@ -184,6 +186,8 @@ class Collector:
                 self._prev_gen, self._prev_gen_t = gen, now
             else:
                 self.live_tok_s, self._prev_gen, self._prev_gen_t = None, None, None
+            if h.get("max_context"):
+                self.max_context = int(h["max_context"])
             with self.lock:
                 self.health = h
                 self.stats = st
@@ -212,7 +216,7 @@ class Collector:
                 idx = int(p[0])
             except ValueError:
                 continue
-            if idx not in GPU_IDS:
+            if GPU_FILTER is not None and idx not in GPU_FILTER:
                 continue
 
             def num(x):
@@ -331,7 +335,7 @@ class Collector:
                 "prompt_reused": (cur or {}).get("reused") if active and cur else (last or {}).get("reused"),
                 "tok_s_window_s": 1 if active else None}
         engine = {"model": "inkling-2-mini", "model_label": "Inkling-2-Mini UD-IQ4_XS + DSpark",
-                  "max_context": MAX_CONTEXT, "images": False, "version": "atlas-ingine",
+                  "max_context": self.max_context, "images": False, "version": "atlas-ingine",
                   "engine_kind": "ik2", "speculation": ["DSpark"]}
         gpu_util = [g["util"] for g in gpus if g.get("util") is not None]
         gpu_mem = [g["mem_used"] for g in gpus if g.get("mem_used") is not None]
@@ -366,7 +370,7 @@ class Collector:
             h = dict(self.health)
         return {"status": "ok", "model": "inkling-2-mini",
                 "model_label": "Inkling-2-Mini UD-IQ4_XS + DSpark",
-                "max_context": MAX_CONTEXT, "images": False, "version": "atlas-ingine",
+                "max_context": self.max_context, "images": False, "version": "atlas-ingine",
                 "api_key": False, "kv_cache_mode": h.get("kv_cache_mode", "per_pass"),
                 "max_batch": h.get("max_batch", 4), "max_queue": h.get("max_queue", 8),
                 "defaults": {"temperature": 1.0, "top_p": 1.0, "top_k": 0}}
@@ -397,7 +401,8 @@ COL = Collector()
 # ---------------------------------------------------------------- electricity (the tracker Maya shipped)
 # The same daemon (energy-cost.py: live ComEd price x this machine's draw, SQLite) and the same summary Maya's
 # Settings > Usage showed.  Cached for 15 s; the script runs at most once per TTL.
-ENERGY_SCRIPT = Path(os.environ.get("IK2_ENERGY_SCRIPT", str(Path.home() / "Maya-data" / "tools" / "energy-cost.py")))
+_ENERGY_ENV = os.environ.get("IK2_ENERGY_SCRIPT", "").strip()
+ENERGY_SCRIPT = Path(_ENERGY_ENV).expanduser() if _ENERGY_ENV else None
 ENERGY_TTL = 15.0
 ENERGY_TIMEOUT = 30.0
 ENERGY_DAYS = 400
@@ -463,8 +468,8 @@ def _energy_refresh(script: Path) -> None:
 
 
 def energy_report() -> dict:
-    if not ENERGY_SCRIPT.is_file():
-        return {"available": False, "why": "no electricity tracker (energy-cost.py not found)"}
+    if ENERGY_SCRIPT is None or not ENERGY_SCRIPT.is_file():
+        return {"available": False, "why": "no electricity tracker (set IK2_ENERGY_SCRIPT)"}
     th = None
     with _energy_lock:
         if time.time() - _energy["t"] > ENERGY_TTL and not _energy["busy"]:
