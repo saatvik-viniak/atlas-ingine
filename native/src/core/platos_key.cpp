@@ -208,54 +208,109 @@ std::optional<int> parse_strict_nonneg_int(std::string_view s) noexcept {
   return v;
 }
 
-// Parses unambiguous single-tap specs ("layer_31", "visit_41"), final-layer specs ("final_normed", "final"),
-// documented unbound single-tap ("single_tap"), and multi-tap concat specs. Preserves legacy unbound behavior
-// when tap_spec is empty; rejects any unrecognized nonempty tap_spec (e.g. "visit41") fail-closed.
-void parse_and_validate_tap_binding(PlatosKeyMetadata& meta, std::optional<int> explicit_tap_layer) {
-  const std::string spec_l = to_lower_ascii(meta.tap_spec);
+struct ParsedTapBinding {
+  bool has_spec = false;
+  std::optional<int> tap_layer;
+  bool requires_final_layer = false;
+  bool is_multi_tap = false;
+  bool is_generic_single_tap = false;
+  std::string raw_spec;
+};
+
+// Parses and validates a single metadata source's (tap_spec, tap_layer) pair independently before any merge.
+// Preserves empty/omitted legacy fields; rejects malformed, conflicting, or unrecognized nonempty tap_spec fail-closed.
+ParsedTapBinding parse_single_tap_source(std::string_view tap_spec, std::optional<int> explicit_tap_layer,
+                                         const char* source_label) {
+  ParsedTapBinding out;
+  out.raw_spec = std::string(tap_spec);
+  const std::string spec_l = to_lower_ascii(tap_spec);
   std::optional<int> spec_tap;
   if (spec_l.empty()) {
-    // Legacy unbound key with no declared tap_spec.
-  } else if (spec_l == "final_normed" || spec_l == "final") {
-    meta.requires_final_layer = true;
-  } else if (spec_l == "single_tap") {
-    // Documented #964 catalog single-tap spec without an encoded layer index (e.g. ling32_h3_single_tap_25m).
-  } else if (spec_l.find("concat") != std::string::npos) {
-    meta.is_multi_tap = true;
-  } else if (spec_l.rfind("layer_", 0) == 0) {
-    spec_tap = parse_strict_nonneg_int(std::string_view(spec_l).substr(6));
-    if (!spec_tap.has_value()) {
-      throw std::invalid_argument("platos_key: malformed tap_spec '" + meta.tap_spec + "'");
-    }
-  } else if (spec_l.rfind("visit_", 0) == 0) {
-    spec_tap = parse_strict_nonneg_int(std::string_view(spec_l).substr(6));
-    if (!spec_tap.has_value()) {
-      throw std::invalid_argument("platos_key: malformed tap_spec '" + meta.tap_spec + "'");
-    }
+    // Omitted tap_spec in this source.
   } else {
-    throw std::invalid_argument("platos_key: unsupported tap_spec '" + meta.tap_spec +
-                                "' (expected 'layer_<N>', 'visit_<N>', 'final_normed', 'final', or 'single_tap')");
+    out.has_spec = true;
+    if (spec_l == "final_normed" || spec_l == "final") {
+      out.requires_final_layer = true;
+    } else if (spec_l == "single_tap") {
+      out.is_generic_single_tap = true;
+    } else if (spec_l.find("concat") != std::string::npos) {
+      out.is_multi_tap = true;
+    } else if (spec_l.rfind("layer_", 0) == 0) {
+      spec_tap = parse_strict_nonneg_int(std::string_view(spec_l).substr(6));
+      if (!spec_tap.has_value()) {
+        throw std::invalid_argument(std::string("platos_key: malformed ") + source_label + " tap_spec '" +
+                                    std::string(tap_spec) + "'");
+      }
+    } else if (spec_l.rfind("visit_", 0) == 0) {
+      spec_tap = parse_strict_nonneg_int(std::string_view(spec_l).substr(6));
+      if (!spec_tap.has_value()) {
+        throw std::invalid_argument(std::string("platos_key: malformed ") + source_label + " tap_spec '" +
+                                    std::string(tap_spec) + "'");
+      }
+    } else {
+      throw std::invalid_argument(std::string("platos_key: unsupported ") + source_label + " tap_spec '" +
+                                  std::string(tap_spec) +
+                                  "' (expected 'layer_<N>', 'visit_<N>', 'final_normed', 'final', or 'single_tap')");
+    }
   }
 
   if (explicit_tap_layer.has_value()) {
     if (*explicit_tap_layer < 0) {
-      throw std::invalid_argument("platos_key: negative tap_layer " + std::to_string(*explicit_tap_layer));
+      throw std::invalid_argument(std::string("platos_key: negative ") + source_label + " tap_layer " +
+                                  std::to_string(*explicit_tap_layer));
     }
-    if (meta.requires_final_layer) {
-      throw std::invalid_argument("platos_key: metadata tap_layer=" + std::to_string(*explicit_tap_layer) +
-                                  " conflicts with tap_spec='" + meta.tap_spec + "'");
+    if (out.requires_final_layer) {
+      throw std::invalid_argument(std::string("platos_key: ") + source_label + " tap_layer=" +
+                                  std::to_string(*explicit_tap_layer) + " conflicts with tap_spec='" +
+                                  std::string(tap_spec) + "'");
     }
-    if (meta.is_multi_tap) {
-      throw std::invalid_argument("platos_key: metadata tap_layer=" + std::to_string(*explicit_tap_layer) +
-                                  " conflicts with multi-tap tap_spec='" + meta.tap_spec + "'");
+    if (out.is_multi_tap) {
+      throw std::invalid_argument(std::string("platos_key: ") + source_label + " tap_layer=" +
+                                  std::to_string(*explicit_tap_layer) + " conflicts with multi-tap tap_spec='" +
+                                  std::string(tap_spec) + "'");
     }
     if (spec_tap.has_value() && *spec_tap != *explicit_tap_layer) {
-      throw std::invalid_argument("platos_key: metadata tap_layer=" + std::to_string(*explicit_tap_layer) +
-                                  " conflicts with tap_spec='" + meta.tap_spec + "'");
+      throw std::invalid_argument(std::string("platos_key: ") + source_label + " tap_layer=" +
+                                  std::to_string(*explicit_tap_layer) + " conflicts with tap_spec='" +
+                                  std::string(tap_spec) + "'");
     }
-    meta.expected_tap_layer = *explicit_tap_layer;
+    out.tap_layer = *explicit_tap_layer;
   } else if (spec_tap.has_value()) {
-    meta.expected_tap_layer = *spec_tap;
+    out.tap_layer = *spec_tap;
+  }
+  return out;
+}
+
+// Reconciles independently validated embedded and sidecar tap bindings; rejects every contradiction fail-closed.
+void reconcile_tap_bindings(const ParsedTapBinding& emb, const ParsedTapBinding& sidecar, PlatosKeyMetadata& meta) {
+  const bool emb_declared = emb.has_spec || emb.tap_layer.has_value();
+  const bool sc_declared = sidecar.has_spec || sidecar.tap_layer.has_value();
+
+  if (emb_declared && sc_declared) {
+    if (emb.is_multi_tap != sidecar.is_multi_tap) {
+      throw std::invalid_argument("platos_key: sidecar tap_spec '" + sidecar.raw_spec +
+                                  "' contradicts embedded tap_spec '" + emb.raw_spec + "' (multi-tap vs single-tap)");
+    }
+    if ((emb.requires_final_layer && sidecar.tap_layer.has_value()) ||
+        (sidecar.requires_final_layer && emb.tap_layer.has_value())) {
+      throw std::invalid_argument("platos_key: sidecar tap declaration ('" + sidecar.raw_spec +
+                                  "') contradicts embedded tap declaration ('" + emb.raw_spec +
+                                  "') (final-layer vs indexed tap)");
+    }
+    if (emb.tap_layer.has_value() && sidecar.tap_layer.has_value() && *emb.tap_layer != *sidecar.tap_layer) {
+      throw std::invalid_argument("platos_key: sidecar tap_layer=" + std::to_string(*sidecar.tap_layer) +
+                                  " (tap_spec='" + sidecar.raw_spec + "') contradicts embedded tap_layer=" +
+                                  std::to_string(*emb.tap_layer) + " (tap_spec='" + emb.raw_spec + "')");
+    }
+  }
+
+  meta.is_multi_tap = emb.is_multi_tap || sidecar.is_multi_tap;
+  meta.requires_final_layer = emb.requires_final_layer || sidecar.requires_final_layer;
+  meta.expected_tap_layer = sidecar.tap_layer.has_value() ? sidecar.tap_layer : emb.tap_layer;
+  if (!sidecar.raw_spec.empty() && !(sidecar.is_generic_single_tap && !emb.raw_spec.empty())) {
+    meta.tap_spec = sidecar.raw_spec;
+  } else {
+    meta.tap_spec = emb.raw_spec;
   }
 }
 
@@ -291,9 +346,14 @@ std::string canonical_checkpoint_id(std::string_view name) {
   return out;
 }
 
-std::optional<int> merge_and_validate_json_metadata(std::string_view json_text, PlatosKeyMetadata& meta) {
-  std::optional<int> explicit_tap_layer;
-  if (json_text.empty()) return explicit_tap_layer;
+struct SidecarTapFields {
+  std::string tap_spec;
+  std::optional<int> tap_layer;
+};
+
+SidecarTapFields merge_and_validate_json_metadata(std::string_view json_text, PlatosKeyMetadata& meta) {
+  SidecarTapFields sc_tap;
+  if (json_text.empty()) return sc_tap;
 
   nlohmann::ordered_json obj;
   try {
@@ -346,7 +406,15 @@ std::optional<int> merge_and_validate_json_metadata(std::string_view json_text, 
   }
 
   if (auto it = obj.find("tap_layer"); it != obj.end() && !it->is_null()) {
-    explicit_tap_layer = parse_json_int(*it, "tap_layer");
+    sc_tap.tap_layer = parse_json_int(*it, "tap_layer");
+  }
+  for (const char* tkey : {"tap_spec", "target_tap"}) {
+    if (auto it = obj.find(tkey); it != obj.end() && !it->is_null()) {
+      if (!it->is_string()) {
+        throw std::invalid_argument(std::string("platos_key: metadata JSON '") + tkey + "' must be a string");
+      }
+      if (sc_tap.tap_spec.empty()) sc_tap.tap_spec = it->get<std::string>();
+    }
   }
   if (auto it = obj.find("forbidden_coord_d2027_zero_masked"); it != obj.end() && !it->is_null()) {
     if (!it->is_boolean()) {
@@ -362,7 +430,7 @@ std::optional<int> merge_and_validate_json_metadata(std::string_view json_text, 
       meta.raw_metadata[k] = v.dump();
     }
   }
-  return explicit_tap_layer;
+  return sc_tap;
 }
 
 }  // namespace
@@ -558,8 +626,21 @@ std::shared_ptr<const PlatosKey> PlatosKey::load_with_json(const std::filesystem
     key->meta_.scale = decode_tensor_f32(buf, *sc)[0];
   }
 
-  // Check embedded safetensors metadata SHA-256 if any, then merge & validate external sidecar JSON.
-  const std::optional<int> explicit_tap = merge_and_validate_json_metadata(metadata_json, key->meta_);
+  // Extract and independently validate embedded safetensors tap fields BEFORE sidecar merge.
+  const std::string emb_tap_spec = meta_get_first(buf.metadata, {"tap_spec", "target_tap"});
+  std::optional<int> emb_tap_layer;
+  if (const std::string raw_emb_tl = meta_get_first(buf.metadata, {"tap_layer"});
+      !raw_emb_tl.empty() && to_lower_ascii(raw_emb_tl) != "none" && to_lower_ascii(raw_emb_tl) != "null") {
+    emb_tap_layer = parse_strict_nonneg_int(raw_emb_tl);
+    if (!emb_tap_layer.has_value()) {
+      throw std::invalid_argument("platos_key: malformed embedded metadata tap_layer '" + raw_emb_tl + "'");
+    }
+  }
+  const ParsedTapBinding emb_tap = parse_single_tap_source(emb_tap_spec, emb_tap_layer, "embedded");
+
+  // Validate sidecar JSON fields (including SHA-256) and independently parse sidecar tap fields.
+  const SidecarTapFields sc_fields = merge_and_validate_json_metadata(metadata_json, key->meta_);
+  const ParsedTapBinding sc_tap = parse_single_tap_source(sc_fields.tap_spec, sc_fields.tap_layer, "sidecar");
 
   key->meta_.format = meta_get_first(key->meta_.raw_metadata, {"format"});
   if (key->meta_.format.empty()) key->meta_.format = detected_format;
@@ -578,7 +659,6 @@ std::shared_ptr<const PlatosKey> PlatosKey::load_with_json(const std::filesystem
     }
   }
   key->meta_.target_model = meta_get_first(key->meta_.raw_metadata, {"target_model"});
-  key->meta_.tap_spec = meta_get_first(key->meta_.raw_metadata, {"tap_spec", "target_tap"});
   key->meta_.method = meta_get_first(key->meta_.raw_metadata, {"method", "solver"});
 
   // Also honor forbidden_coord_d2027_zero_masked if declared in embedded safetensors metadata or deployment_spec.
@@ -600,18 +680,7 @@ std::shared_ptr<const PlatosKey> PlatosKey::load_with_json(const std::filesystem
     }
   }
 
-  // If tap_layer wasn't in sidecar JSON, check embedded raw_metadata["tap_layer"].
-  std::optional<int> tap_from_meta = explicit_tap;
-  if (!tap_from_meta.has_value()) {
-    if (const std::string raw_tl = meta_get_first(key->meta_.raw_metadata, {"tap_layer"});
-        !raw_tl.empty() && to_lower_ascii(raw_tl) != "none" && to_lower_ascii(raw_tl) != "null") {
-      tap_from_meta = parse_strict_nonneg_int(raw_tl);
-      if (!tap_from_meta.has_value()) {
-        throw std::invalid_argument("platos_key: malformed metadata tap_layer '" + raw_tl + "'");
-      }
-    }
-  }
-  parse_and_validate_tap_binding(key->meta_, tap_from_meta);
+  reconcile_tap_bindings(emb_tap, sc_tap, key->meta_);
   return key;
 }
 

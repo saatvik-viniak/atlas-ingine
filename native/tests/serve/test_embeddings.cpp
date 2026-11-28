@@ -595,6 +595,65 @@ void test_cartridge_964_binding_and_layouts_fail_closed() {
     const Response r_leg = http_req(s_legacy->port(), "POST", "/v1/embeddings",
                                     Json{{"input", "hello"}, {"platos_key", true}}.dump());
     CHECK(r_leg.status == 200);
+
+    // Rev4 regression: contradictory embedded tap_spec=visit_23 vs sidecar tap_spec=visit_41 MUST fail closed!
+    const auto p_emb23 = tmp / "key_emb23.safetensors";
+    write_safetensors(p_emb23, {{"R", "F32", {D_IN, D_OUT}, pack_f32(R)}},
+                      {{"format", "platos_key_v1"}, {"tap_spec", "visit_23"}, {"donor_model", "Inkling-2-Mini-NVFP4"}});
+    const std::string sha_emb23 = PlatosKey::load(p_emb23, D_IN)->metadata().file_sha256;
+    const auto m_sidecar41 = tmp / "sidecar_41.json";
+    {
+      std::ofstream mf(m_sidecar41);
+      mf << Json{{"cartridge_sha256", sha_emb23},
+                 {"donor_model_id", "thinkingmachines/Inkling-2-Mini"},
+                 {"d_donor", D_IN},
+                 {"d_target", D_OUT},
+                 {"tap_spec", "visit_41"},
+                 {"tap_layer", 41}}
+                .dump();
+    }
+    bool threw_emb_vs_sc = false;
+    try {
+      (void)make_served(1024, 8, p_emb23, m_sidecar41);
+    } catch (const std::invalid_argument&) {
+      threw_emb_vs_sc = true;
+    }
+    CHECK(threw_emb_vs_sc);
+
+    // Compatible alias (embedded visit_23 + sidecar layer_23 / tap_layer=23) succeeds and binds tap_layer=23!
+    const auto m_compat23 = tmp / "sidecar_compat23.json";
+    {
+      std::ofstream mf(m_compat23);
+      mf << Json{{"cartridge_sha256", sha_emb23},
+                 {"donor_model_id", "thinkingmachines/Inkling-2-Mini"},
+                 {"d_donor", D_IN},
+                 {"d_target", D_OUT},
+                 {"tap_spec", "layer_23"},
+                 {"tap_layer", 23}}
+                .dump();
+    }
+    auto s_compat = make_served(1024, 8, p_emb23, m_compat23);
+    const Response r_c23 = http_req(s_compat->port(), "POST", "/v1/embeddings",
+                                    Json{{"input", "hello"}, {"tap_layer", 23}, {"platos_key", true}}.dump());
+    CHECK(r_c23.status == 200);
+
+    // Embedded multi-tap concat_all4 cannot be masked by sidecar single-tap visit_41!
+    const auto p_emb_concat = tmp / "key_emb_concat.safetensors";
+    write_safetensors(p_emb_concat, {{"R", "F32", {D_IN, D_OUT}, pack_f32(R)}},
+                      {{"format", "platos_key_v1"}, {"tap_spec", "concat_all4"}});
+    const std::string sha_emb_concat = PlatosKey::load(p_emb_concat, D_IN)->metadata().file_sha256;
+    const auto m_mask_concat = tmp / "mask_concat.json";
+    {
+      std::ofstream mf(m_mask_concat);
+      mf << Json{{"cartridge_sha256", sha_emb_concat}, {"tap_spec", "visit_41"}, {"tap_layer", 41}}.dump();
+    }
+    bool threw_mask_concat = false;
+    try {
+      (void)PlatosKey::load(p_emb_concat, m_mask_concat, D_IN);
+    } catch (const std::invalid_argument&) {
+      threw_mask_concat = true;
+    }
+    CHECK(threw_mask_concat);
   }
 
   // 4) Final-layer bound key (`tap_spec: "final_normed"`): accepts omitted tap_layer, rejects explicit tap_layer!
