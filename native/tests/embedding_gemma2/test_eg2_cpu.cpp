@@ -5,6 +5,7 @@
 //   4) Synthetic 2-layer Eg2CpuEncoder: sliding + full attn, PLE, layer_scalar, Matryoshka, tap_layer, PlatosKey
 //   5) End-to-end HTTP ChatServer with EmbeddingGemma2 (prompt_name, dimensions, encoder-only 400, /health, /v1/models)
 //   6) Real checkpoint FP32 CPU oracle parity (when /mnt/storage/models/embeddinggemma-2 is present)
+#include "backends/embedding_gemma2/eg2_audio.h"
 #include "backends/embedding_gemma2/eg2_config.h"
 #include "backends/embedding_gemma2/eg2_cpu.h"
 #include "backends/embedding_gemma2/eg2_manifest.h"
@@ -480,6 +481,140 @@ void test_phase2_vision_preprocess_and_synthetic_scatter() {
   std::printf("[PASS] Phase 2 vision preprocessing, bicubic antialias & synthetic ViT encoder verified\n");
 }
 
+void test_phase3_audio_wav_mel_and_synthetic_conformer() {
+  // Build deterministic PCM16 16kHz WAV in memory (1.0s = 16000 samples, 440Hz sine)
+  auto make_wav_pcm16 = [](int n_samples, int sr, int channels, double freq) {
+    const std::uint32_t data_bytes = static_cast<std::uint32_t>(n_samples * channels * 2);
+    std::vector<std::uint8_t> b(44 + data_bytes, 0);
+    std::memcpy(b.data() + 0, "RIFF", 4);
+    const std::uint32_t riff_sz = 36 + data_bytes;
+    std::memcpy(b.data() + 4, &riff_sz, 4);
+    std::memcpy(b.data() + 8, "WAVE", 4);
+    std::memcpy(b.data() + 12, "fmt ", 4);
+    const std::uint32_t fmt_sz = 16;
+    const std::uint16_t audio_fmt = 1, n_ch = static_cast<std::uint16_t>(channels), bps = 16;
+    const std::uint32_t sr32 = static_cast<std::uint32_t>(sr);
+    const std::uint32_t byte_rate = sr32 * n_ch * 2;
+    const std::uint16_t block_align = static_cast<std::uint16_t>(n_ch * 2);
+    std::memcpy(b.data() + 16, &fmt_sz, 4);
+    std::memcpy(b.data() + 20, &audio_fmt, 2);
+    std::memcpy(b.data() + 22, &n_ch, 2);
+    std::memcpy(b.data() + 24, &sr32, 4);
+    std::memcpy(b.data() + 28, &byte_rate, 4);
+    std::memcpy(b.data() + 32, &block_align, 2);
+    std::memcpy(b.data() + 34, &bps, 2);
+    std::memcpy(b.data() + 36, "data", 4);
+    std::memcpy(b.data() + 40, &data_bytes, 4);
+    for (int i = 0; i < n_samples; ++i) {
+      const double v = 0.5 * std::sin(2.0 * 3.14159265358979323846 * freq * static_cast<double>(i) / sr);
+      const std::int16_t s = static_cast<std::int16_t>(std::llround(v * 32767.0));
+      for (int c = 0; c < channels; ++c) {
+        std::memcpy(b.data() + 44 + (i * channels + c) * 2, &s, 2);
+      }
+    }
+    return b;
+  };
+
+  // 1.0s mono 16kHz -> 99 mel frames -> 25 SSCP valid audio soft tokens
+  {
+    const auto wav = make_wav_pcm16(16000, 16000, 1, 440.0);
+    const auto dec = eg2_decode_wav_bytes(wav);
+    CHECK(dec.sample_rate == 16000 && dec.samples.size() == 16000);
+    const auto prep = eg2_preprocess_audio(dec);
+    CHECK(prep.mel_frames == 99 && prep.num_mels == 128 && prep.sscp_frames == 25 && prep.num_valid_tokens == 25);
+    for (float v : prep.mel_f32) CHECK(std::isfinite(v));
+  }
+  // Odd-length 21950 samples (~1.372s, tests pad_to_multiple_of=128) -> 137 mel frames -> 35 valid audio soft tokens
+  {
+    const auto wav = make_wav_pcm16(21950, 16000, 2, 880.0);  // stereo downmix check too
+    const auto dec = eg2_decode_wav_bytes(wav);
+    CHECK(dec.sample_rate == 16000 && dec.samples.size() == 21950);
+    const auto prep = eg2_preprocess_audio(dec);
+    CHECK(prep.mel_frames == 137 && prep.num_valid_tokens == 35);
+  }
+  // Resampling check (8kHz 1.0s -> 16kHz 16000 samples)
+  {
+    const auto wav8 = make_wav_pcm16(8000, 8000, 1, 440.0);
+    const auto dec = eg2_decode_wav_bytes(wav8);
+    CHECK(dec.sample_rate == 16000 && dec.samples.size() == 16000);
+  }
+  // Corrupt WAV rejected fail-closed
+  {
+    const std::vector<std::uint8_t> junk = {'N', 'O', 'P', 'E', 0, 1, 2, 3};
+    bool threw = false;
+    try {
+      (void)eg2_decode_wav_bytes(junk);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+
+  // Synthetic mini Audio Conformer forward sanity check (1 layer, AH=16, 2 heads, hd=8, C0=4, C1=2, OP=12, TH=8)
+  {
+    Eg2AudioWeightsF32 aw;
+    aw.config.hidden_size = 16;
+    aw.config.num_hidden_layers = 1;
+    aw.config.num_attention_heads = 2;
+    aw.config.output_proj_dims = 12;
+    aw.config.conv_kernel_size = 5;
+    aw.config.sscp_conv_channels_0 = 4;
+    aw.config.sscp_conv_channels_1 = 2;
+    aw.config.use_clipped_linears = true;
+    aw.text_hidden_size = 8;
+    aw.sscp_layer0_conv.assign(4 * 1 * 9, 0.02f);
+    aw.sscp_layer0_norm.assign(4, 1.0f);
+    aw.sscp_layer1_conv.assign(2 * 4 * 9, 0.02f);
+    aw.sscp_layer1_norm.assign(2, 1.0f);
+    aw.sscp_input_proj_linear.assign(16 * (32 * 2), 0.01f);
+    aw.output_proj_weight.assign(12 * 16, 0.02f);
+    aw.output_proj_bias.assign(12, 0.01f);
+    aw.embed_audio_projection.assign(8 * 12, 0.03f);
+    aw.layers.resize(1);
+    auto fill_clip = [](int rows, int cols) {
+      Eg2ClippedLinearF32 c;
+      c.weight.assign(static_cast<std::size_t>(rows) * cols, 0.01f);
+      c.input_min = -10.0f;
+      c.input_max = 10.0f;
+      c.output_min = -10.0f;
+      c.output_max = 10.0f;
+      return c;
+    };
+    auto& lw = aw.layers[0];
+    lw.feed_forward1.pre_layer_norm.assign(16, 1.0f);
+    lw.feed_forward1.ffw_layer_1 = fill_clip(64, 16);
+    lw.feed_forward1.ffw_layer_2 = fill_clip(16, 64);
+    lw.feed_forward1.post_layer_norm.assign(16, 1.0f);
+    lw.norm_pre_attn.assign(16, 1.0f);
+    lw.q_proj = fill_clip(16, 16);
+    lw.k_proj = fill_clip(16, 16);
+    lw.v_proj = fill_clip(16, 16);
+    lw.relative_k_proj.assign(16 * 16, 0.01f);
+    lw.per_dim_scale.assign(8, 0.0f);
+    lw.post = fill_clip(16, 16);
+    lw.norm_post_attn.assign(16, 1.0f);
+    lw.lconv_pre_layer_norm.assign(16, 1.0f);
+    lw.lconv_linear_start = fill_clip(32, 16);
+    lw.lconv_depthwise_conv1d.assign(16 * 1 * 5, 0.05f);
+    lw.lconv_conv_norm.assign(16, 1.0f);
+    lw.lconv_linear_end = fill_clip(16, 16);
+    lw.feed_forward2.pre_layer_norm.assign(16, 1.0f);
+    lw.feed_forward2.ffw_layer_1 = fill_clip(64, 16);
+    lw.feed_forward2.ffw_layer_2 = fill_clip(16, 64);
+    lw.feed_forward2.post_layer_norm.assign(16, 1.0f);
+    lw.norm_out.assign(16, 1.0f);
+
+    Eg2CpuAudioEncoder aenc(std::move(aw));
+    ingine::model::EmbeddingAudio clip;
+    clip.sample_rate = 16000;
+    clip.samples.assign(3200, 0.25f);  // 0.2s -> 19 mel -> 5 valid audio tokens
+    const auto soft = aenc.encode_audio(clip);
+    CHECK(soft.size() == 5u * 8u);
+    for (float v : soft) CHECK(std::isfinite(v));
+  }
+  std::printf("[PASS] Phase 3 audio WAV decode, 128-bin HTK log-mel STFT & synthetic Conformer verified\n");
+}
+
 }  // namespace
 
 int main() {
@@ -487,6 +622,7 @@ int main() {
     test_model_family_enum();
     test_synthetic_cpu_encoder_and_matryoshka();
     test_phase2_vision_preprocess_and_synthetic_scatter();
+    test_phase3_audio_wav_mel_and_synthetic_conformer();
     const auto eg2_dir = find_eg2_model_dir();
     if (!eg2_dir.empty()) {
       test_real_checkpoint_tokenizer_manifest_http_and_oracle(eg2_dir);

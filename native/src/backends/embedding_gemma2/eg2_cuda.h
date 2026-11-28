@@ -31,7 +31,7 @@ class Eg2CudaBackend final : public ingine::model::ModelBackend {
                                         std::span<const std::int32_t>,
                                         const std::function<bool(std::span<const std::int32_t>)>&) override;
   bool supports_images() const override { return has_vision_; }
-  bool supports_audio() const override { return false; }
+  bool supports_audio() const override { return has_audio_; }
   bool is_encoder_only() const override { return true; }
   bool supports_logit_masker() const override { return false; }
   std::string model_family() const override { return "embedding_gemma2"; }
@@ -71,6 +71,7 @@ class Eg2CudaBackend final : public ingine::model::ModelBackend {
   int max_ctx_ = 8192;
   bool use_bf16_ = false;
   bool has_vision_ = false;
+  bool has_audio_ = false;
   ingine::model::BackendCapabilities caps_;
   ingine::model::WorkerProfile profile_;
   ingine::model::BackendStateIdentity identity_;

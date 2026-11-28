@@ -42,6 +42,25 @@ struct Eg2VisionConfig {
   bool use_clipped_linears = false;
 };
 
+struct Eg2AudioConfig {
+  int hidden_size = 1024;
+  int num_hidden_layers = 12;
+  int num_attention_heads = 8;
+  int output_proj_dims = 1536;
+  int conv_kernel_size = 5;
+  int attention_chunk_size = 12;
+  int attention_context_left = 13;
+  int attention_context_right = 0;
+  float attention_logit_cap = 50.0f;
+  float attention_invalid_logits_value = -1e9f;
+  float gradient_clipping = 1e10f;
+  float residual_weight = 0.5f;
+  float rms_norm_eps = 1e-6f;
+  int sscp_conv_channels_0 = 128;
+  int sscp_conv_channels_1 = 32;
+  bool use_clipped_linears = true;
+};
+
 struct Eg2Config {
   std::string model_type = "embedding_gemma2";
   std::vector<std::string> architectures;
@@ -84,6 +103,7 @@ struct Eg2Config {
   bool has_audio_config = false;
   int vision_soft_tokens_per_image = 280;
   Eg2VisionConfig vision;
+  Eg2AudioConfig audio;
 
   // Named task prefixes from config_sentence_transformers.json (optional)
   std::map<std::string, std::string> prompts;

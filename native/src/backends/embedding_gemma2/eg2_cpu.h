@@ -2,6 +2,7 @@
 // Runs identically on CUDA-free builds, desktop/mobile routers, and CPU unit parity tests.
 #pragma once
 
+#include "backends/embedding_gemma2/eg2_audio.h"
 #include "backends/embedding_gemma2/eg2_config.h"
 #include "backends/embedding_gemma2/eg2_manifest.h"
 #include "backends/embedding_gemma2/eg2_vision.h"
@@ -27,15 +28,18 @@ class Eg2CpuEncoder {
 
   // Forward a single token sequence [T] -> hidden [T, H] (after final norm if tap_layer == nullopt,
   // else after layer `*tap_layer` [0..num_hidden_layers-1]). Optional `vision_soft_tokens`
-  // ([N_vision_soft * H] FP32) are scattered onto `<|image|>` / `<|video|>` placeholders before PLE.
+  // ([N_vision_soft * H] FP32) and `audio_soft_tokens` ([N_audio_soft * H] FP32) are scattered onto
+  // `<|image|>`/`<|video|>` and `<|audio|>` placeholders respectively before PLE.
   std::vector<float> encode_hidden(std::span<const std::int32_t> token_ids,
                                    std::optional<int> tap_layer = std::nullopt,
-                                   std::span<const float> vision_soft_tokens = {}) const;
+                                   std::span<const float> vision_soft_tokens = {},
+                                   std::span<const float> audio_soft_tokens = {}) const;
 
   // Full batched embedding forward matching Generator::embed() semantics.
   ingine::model::EmbeddingResult embed(const ingine::model::EmbeddingRequest& req,
                                        const PlatosKey* platos_key = nullptr,
-                                       const Eg2CpuVisionEncoder* vision_encoder = nullptr) const;
+                                       const Eg2CpuVisionEncoder* vision_encoder = nullptr,
+                                       const Eg2CpuAudioEncoder* audio_encoder = nullptr) const;
 
  private:
   Eg2TextWeightsF32 weights_;
@@ -56,7 +60,7 @@ class Eg2CpuBackend final : public ingine::model::ModelBackend {
                                         std::span<const std::int32_t>,
                                         const std::function<bool(std::span<const std::int32_t>)>&) override;
   bool supports_images() const override { return vision_encoder_ != nullptr; }
-  bool supports_audio() const override { return false; }
+  bool supports_audio() const override { return audio_encoder_ != nullptr; }
   bool is_encoder_only() const override { return true; }
   bool supports_logit_masker() const override { return false; }
   std::string model_family() const override { return "embedding_gemma2"; }
@@ -85,12 +89,14 @@ class Eg2CpuBackend final : public ingine::model::ModelBackend {
 
   const Eg2Config& config() const noexcept { return encoder_.config(); }
   const Eg2CpuVisionEncoder* vision_encoder() const noexcept { return vision_encoder_.get(); }
+  const Eg2CpuAudioEncoder* audio_encoder() const noexcept { return audio_encoder_.get(); }
 
  private:
   void init_metadata();
 
   Eg2CpuEncoder encoder_;
   std::unique_ptr<Eg2CpuVisionEncoder> vision_encoder_;
+  std::unique_ptr<Eg2CpuAudioEncoder> audio_encoder_;
   std::shared_ptr<const PlatosKey> platos_key_;
   std::string model_id_ = "embeddinggemma-2";
   int max_ctx_ = 8192;

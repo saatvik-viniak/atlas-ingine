@@ -146,11 +146,111 @@ struct Eg2VisionWeightsBf16 {
   std::vector<std::uint16_t> embed_vision_projection;
 };
 
+struct Eg2ClippedLinearF32 {
+  std::vector<float> weight;
+  float input_min = -1e30f;
+  float input_max = 1e30f;
+  float output_min = -1e30f;
+  float output_max = 1e30f;
+};
+
+struct Eg2ClippedLinearBf16 {
+  std::vector<std::uint16_t> weight;
+  float input_min = -1e30f;
+  float input_max = 1e30f;
+  float output_min = -1e30f;
+  float output_max = 1e30f;
+};
+
+struct Eg2AudioFfwWeightsF32 {
+  std::vector<float> pre_layer_norm;   // [AH]
+  Eg2ClippedLinearF32 ffw_layer_1;     // [4*AH, AH]
+  Eg2ClippedLinearF32 ffw_layer_2;     // [AH, 4*AH]
+  std::vector<float> post_layer_norm;  // [AH]
+};
+
+struct Eg2AudioFfwWeightsBf16 {
+  std::vector<std::uint16_t> pre_layer_norm;
+  Eg2ClippedLinearBf16 ffw_layer_1;
+  Eg2ClippedLinearBf16 ffw_layer_2;
+  std::vector<std::uint16_t> post_layer_norm;
+};
+
+struct Eg2AudioLayerWeightsF32 {
+  Eg2AudioFfwWeightsF32 feed_forward1;
+  std::vector<float> norm_pre_attn;          // [AH]
+  Eg2ClippedLinearF32 q_proj;                // [AH, AH]
+  Eg2ClippedLinearF32 k_proj;                // [AH, AH]
+  Eg2ClippedLinearF32 v_proj;                // [AH, AH]
+  std::vector<float> relative_k_proj;        // [AH, AH]
+  std::vector<float> per_dim_scale;          // [AHD]
+  Eg2ClippedLinearF32 post;                  // [AH, AH]
+  std::vector<float> norm_post_attn;         // [AH]
+  std::vector<float> lconv_pre_layer_norm;   // [AH]
+  Eg2ClippedLinearF32 lconv_linear_start;    // [2*AH, AH]
+  std::vector<float> lconv_depthwise_conv1d; // [AH, 1, K]
+  std::vector<float> lconv_conv_norm;        // [AH]
+  Eg2ClippedLinearF32 lconv_linear_end;      // [AH, AH]
+  Eg2AudioFfwWeightsF32 feed_forward2;
+  std::vector<float> norm_out;               // [AH]
+};
+
+struct Eg2AudioLayerWeightsBf16 {
+  Eg2AudioFfwWeightsBf16 feed_forward1;
+  std::vector<std::uint16_t> norm_pre_attn;
+  Eg2ClippedLinearBf16 q_proj;
+  Eg2ClippedLinearBf16 k_proj;
+  Eg2ClippedLinearBf16 v_proj;
+  std::vector<std::uint16_t> relative_k_proj;
+  std::vector<float> per_dim_scale;  // kept FP32 for exact softplus(per_dim_scale)
+  Eg2ClippedLinearBf16 post;
+  std::vector<std::uint16_t> norm_post_attn;
+  std::vector<std::uint16_t> lconv_pre_layer_norm;
+  Eg2ClippedLinearBf16 lconv_linear_start;
+  std::vector<std::uint16_t> lconv_depthwise_conv1d;
+  std::vector<std::uint16_t> lconv_conv_norm;
+  Eg2ClippedLinearBf16 lconv_linear_end;
+  Eg2AudioFfwWeightsBf16 feed_forward2;
+  std::vector<std::uint16_t> norm_out;
+};
+
+struct Eg2AudioWeightsF32 {
+  Eg2AudioConfig config;
+  int text_hidden_size = 512;
+  std::vector<float> sscp_layer0_conv;        // [C0, 1, 3, 3]
+  std::vector<float> sscp_layer0_norm;        // [C0]
+  std::vector<float> sscp_layer1_conv;        // [C1, C0, 3, 3]
+  std::vector<float> sscp_layer1_norm;        // [C1]
+  std::vector<float> sscp_input_proj_linear;  // [AH, (128/4)*C1]
+  std::vector<Eg2AudioLayerWeightsF32> layers;
+  std::vector<float> output_proj_weight;      // [output_proj_dims, AH]
+  std::vector<float> output_proj_bias;        // [output_proj_dims]
+  std::vector<float> embed_audio_projection;  // [text_H, output_proj_dims]
+};
+
+struct Eg2AudioWeightsBf16 {
+  Eg2AudioConfig config;
+  int text_hidden_size = 512;
+  std::vector<std::uint16_t> sscp_layer0_conv;
+  std::vector<std::uint16_t> sscp_layer0_norm;
+  std::vector<std::uint16_t> sscp_layer1_conv;
+  std::vector<std::uint16_t> sscp_layer1_norm;
+  std::vector<std::uint16_t> sscp_input_proj_linear;
+  std::vector<Eg2AudioLayerWeightsBf16> layers;
+  std::vector<std::uint16_t> output_proj_weight;
+  std::vector<std::uint16_t> output_proj_bias;
+  std::vector<std::uint16_t> embed_audio_projection;
+};
+
 // Selectively reads ONLY language_model.* tensors as raw BF16 uint16_t words (used by sm_80+ CUDA).
 Eg2TextWeightsBf16 load_eg2_text_weights_bf16(const std::filesystem::path& model_dir);
 
 // Selectively reads ONLY vision_tower.* + embed_vision.* tensors (211 tensors; 319.97 MiB BF16 / 639.94 MiB FP32).
 Eg2VisionWeightsF32 load_eg2_vision_weights_f32(const std::filesystem::path& model_dir);
 Eg2VisionWeightsBf16 load_eg2_vision_weights_bf16(const std::filesystem::path& model_dir);
+
+// Selectively reads ONLY audio_tower.* + embed_audio.* tensors (752 tensors; 582.91 MiB BF16 / 1165.82 MiB FP32).
+Eg2AudioWeightsF32 load_eg2_audio_weights_f32(const std::filesystem::path& model_dir);
+Eg2AudioWeightsBf16 load_eg2_audio_weights_bf16(const std::filesystem::path& model_dir);
 
 }  // namespace ingine::backends::embedding_gemma2

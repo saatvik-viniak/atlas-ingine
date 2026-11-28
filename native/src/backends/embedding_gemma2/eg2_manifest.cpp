@@ -332,4 +332,214 @@ Eg2VisionWeightsBf16 load_eg2_vision_weights_bf16(const std::filesystem::path& m
   return w;
 }
 
+namespace {
+
+void require_scalar_tensor(const SafetensorsModel& model, std::string_view name) {
+  const SafetensorsRef ref = model.find(name);
+  if (!ref) {
+    throw std::invalid_argument("EmbeddingGemma2 safetensors missing required scalar tensor: " + std::string(name));
+  }
+  if (ref->dtype != "BF16" && ref->dtype != "F32") {
+    throw std::invalid_argument("EmbeddingGemma2 tensor '" + std::string(name) + "' has unsupported dtype '" +
+                                ref->dtype + "' (only BF16/F32 permitted; FP16 is forbidden)");
+  }
+  if (ref->numel() != 1) {
+    throw std::invalid_argument("EmbeddingGemma2 scalar tensor '" + std::string(name) + "' expected 1 element");
+  }
+}
+
+void validate_clipped_linear(const SafetensorsModel& model, const std::string& prefix, std::int64_t out_dim,
+                             std::int64_t in_dim, bool clipped) {
+  require_tensor_shape_and_dtype(model, prefix + ".linear.weight", {out_dim, in_dim});
+  if (clipped) {
+    require_scalar_tensor(model, prefix + ".input_min");
+    require_scalar_tensor(model, prefix + ".input_max");
+    require_scalar_tensor(model, prefix + ".output_min");
+    require_scalar_tensor(model, prefix + ".output_max");
+  }
+}
+
+void validate_audio_tensors(const SafetensorsModel& model, const Eg2Config& cfg) {
+  if (!cfg.has_audio_config) {
+    throw std::invalid_argument("EmbeddingGemma2: model config has no audio_config");
+  }
+  const Eg2AudioConfig& ac = cfg.audio;
+  const std::int64_t AH = ac.hidden_size;
+  const std::int64_t AHD = AH / ac.num_attention_heads;
+  const std::int64_t C0 = ac.sscp_conv_channels_0;
+  const std::int64_t C1 = ac.sscp_conv_channels_1;
+  const std::int64_t sscp_in = (128 / 4) * C1;
+  const std::int64_t OP = ac.output_proj_dims;
+  const std::int64_t K = ac.conv_kernel_size;
+
+  require_tensor_shape_and_dtype(model, "audio_tower.subsample_conv_projection.layer0.conv.weight", {C0, 1, 3, 3});
+  require_tensor_shape_and_dtype(model, "audio_tower.subsample_conv_projection.layer0.norm.weight", {C0});
+  require_tensor_shape_and_dtype(model, "audio_tower.subsample_conv_projection.layer1.conv.weight", {C1, C0, 3, 3});
+  require_tensor_shape_and_dtype(model, "audio_tower.subsample_conv_projection.layer1.norm.weight", {C1});
+  require_tensor_shape_and_dtype(model, "audio_tower.subsample_conv_projection.input_proj_linear.weight", {AH, sscp_in});
+  require_tensor_shape_and_dtype(model, "audio_tower.output_proj.weight", {OP, AH});
+  require_tensor_shape_and_dtype(model, "audio_tower.output_proj.bias", {OP});
+  require_tensor_shape_and_dtype(model, "embed_audio.embedding_projection.weight", {cfg.hidden_size, OP});
+
+  for (int i = 0; i < ac.num_hidden_layers; ++i) {
+    const std::string p = "audio_tower.layers." + std::to_string(i) + ".";
+    require_tensor_shape_and_dtype(model, p + "feed_forward1.pre_layer_norm.weight", {AH});
+    validate_clipped_linear(model, p + "feed_forward1.ffw_layer_1", 4 * AH, AH, ac.use_clipped_linears);
+    validate_clipped_linear(model, p + "feed_forward1.ffw_layer_2", AH, 4 * AH, ac.use_clipped_linears);
+    require_tensor_shape_and_dtype(model, p + "feed_forward1.post_layer_norm.weight", {AH});
+
+    require_tensor_shape_and_dtype(model, p + "norm_pre_attn.weight", {AH});
+    validate_clipped_linear(model, p + "self_attn.q_proj", AH, AH, ac.use_clipped_linears);
+    validate_clipped_linear(model, p + "self_attn.k_proj", AH, AH, ac.use_clipped_linears);
+    validate_clipped_linear(model, p + "self_attn.v_proj", AH, AH, ac.use_clipped_linears);
+    require_tensor_shape_and_dtype(model, p + "self_attn.relative_k_proj.weight", {AH, AH});
+    require_tensor_shape_and_dtype(model, p + "self_attn.per_dim_scale", {AHD});
+    validate_clipped_linear(model, p + "self_attn.post", AH, AH, ac.use_clipped_linears);
+    require_tensor_shape_and_dtype(model, p + "norm_post_attn.weight", {AH});
+
+    require_tensor_shape_and_dtype(model, p + "lconv1d.pre_layer_norm.weight", {AH});
+    validate_clipped_linear(model, p + "lconv1d.linear_start", 2 * AH, AH, ac.use_clipped_linears);
+    require_tensor_shape_and_dtype(model, p + "lconv1d.depthwise_conv1d.weight", {AH, 1, K});
+    require_tensor_shape_and_dtype(model, p + "lconv1d.conv_norm.weight", {AH});
+    validate_clipped_linear(model, p + "lconv1d.linear_end", AH, AH, ac.use_clipped_linears);
+
+    require_tensor_shape_and_dtype(model, p + "feed_forward2.pre_layer_norm.weight", {AH});
+    validate_clipped_linear(model, p + "feed_forward2.ffw_layer_1", 4 * AH, AH, ac.use_clipped_linears);
+    validate_clipped_linear(model, p + "feed_forward2.ffw_layer_2", AH, 4 * AH, ac.use_clipped_linears);
+    require_tensor_shape_and_dtype(model, p + "feed_forward2.post_layer_norm.weight", {AH});
+
+    require_tensor_shape_and_dtype(model, p + "norm_out.weight", {AH});
+  }
+}
+
+Eg2ClippedLinearF32 read_clipped_f32(const SafetensorsModel& model, const std::string& prefix, bool clipped) {
+  Eg2ClippedLinearF32 c;
+  c.weight = read_tensor_f32(model, prefix + ".linear.weight");
+  if (clipped) {
+    c.input_min = read_scalar_f32(model, prefix + ".input_min");
+    c.input_max = read_scalar_f32(model, prefix + ".input_max");
+    c.output_min = read_scalar_f32(model, prefix + ".output_min");
+    c.output_max = read_scalar_f32(model, prefix + ".output_max");
+  }
+  return c;
+}
+
+Eg2ClippedLinearBf16 read_clipped_bf16(const SafetensorsModel& model, const std::string& prefix, bool clipped) {
+  Eg2ClippedLinearBf16 c;
+  c.weight = read_tensor_bf16(model, prefix + ".linear.weight");
+  if (clipped) {
+    c.input_min = read_scalar_f32(model, prefix + ".input_min");
+    c.input_max = read_scalar_f32(model, prefix + ".input_max");
+    c.output_min = read_scalar_f32(model, prefix + ".output_min");
+    c.output_max = read_scalar_f32(model, prefix + ".output_max");
+  }
+  return c;
+}
+
+}  // namespace
+
+Eg2AudioWeightsF32 load_eg2_audio_weights_f32(const std::filesystem::path& model_dir) {
+  const Eg2Config cfg = Eg2Config::load(model_dir);
+  SafetensorsModel model(model_dir, SafetensorsOpenMode::SafetensorsOnly);
+  validate_audio_tensors(model, cfg);
+
+  Eg2AudioWeightsF32 w;
+  w.config = cfg.audio;
+  w.text_hidden_size = cfg.hidden_size;
+  w.sscp_layer0_conv = read_tensor_f32(model, "audio_tower.subsample_conv_projection.layer0.conv.weight");
+  w.sscp_layer0_norm = read_tensor_f32(model, "audio_tower.subsample_conv_projection.layer0.norm.weight");
+  w.sscp_layer1_conv = read_tensor_f32(model, "audio_tower.subsample_conv_projection.layer1.conv.weight");
+  w.sscp_layer1_norm = read_tensor_f32(model, "audio_tower.subsample_conv_projection.layer1.norm.weight");
+  w.sscp_input_proj_linear = read_tensor_f32(model, "audio_tower.subsample_conv_projection.input_proj_linear.weight");
+  w.output_proj_weight = read_tensor_f32(model, "audio_tower.output_proj.weight");
+  w.output_proj_bias = read_tensor_f32(model, "audio_tower.output_proj.bias");
+  w.embed_audio_projection = read_tensor_f32(model, "embed_audio.embedding_projection.weight");
+
+  const bool cl = cfg.audio.use_clipped_linears;
+  w.layers.resize(static_cast<std::size_t>(cfg.audio.num_hidden_layers));
+  for (int i = 0; i < cfg.audio.num_hidden_layers; ++i) {
+    const std::string p = "audio_tower.layers." + std::to_string(i) + ".";
+    auto& lw = w.layers[static_cast<std::size_t>(i)];
+    lw.feed_forward1.pre_layer_norm = read_tensor_f32(model, p + "feed_forward1.pre_layer_norm.weight");
+    lw.feed_forward1.ffw_layer_1 = read_clipped_f32(model, p + "feed_forward1.ffw_layer_1", cl);
+    lw.feed_forward1.ffw_layer_2 = read_clipped_f32(model, p + "feed_forward1.ffw_layer_2", cl);
+    lw.feed_forward1.post_layer_norm = read_tensor_f32(model, p + "feed_forward1.post_layer_norm.weight");
+
+    lw.norm_pre_attn = read_tensor_f32(model, p + "norm_pre_attn.weight");
+    lw.q_proj = read_clipped_f32(model, p + "self_attn.q_proj", cl);
+    lw.k_proj = read_clipped_f32(model, p + "self_attn.k_proj", cl);
+    lw.v_proj = read_clipped_f32(model, p + "self_attn.v_proj", cl);
+    lw.relative_k_proj = read_tensor_f32(model, p + "self_attn.relative_k_proj.weight");
+    lw.per_dim_scale = read_tensor_f32(model, p + "self_attn.per_dim_scale");
+    lw.post = read_clipped_f32(model, p + "self_attn.post", cl);
+    lw.norm_post_attn = read_tensor_f32(model, p + "norm_post_attn.weight");
+
+    lw.lconv_pre_layer_norm = read_tensor_f32(model, p + "lconv1d.pre_layer_norm.weight");
+    lw.lconv_linear_start = read_clipped_f32(model, p + "lconv1d.linear_start", cl);
+    lw.lconv_depthwise_conv1d = read_tensor_f32(model, p + "lconv1d.depthwise_conv1d.weight");
+    lw.lconv_conv_norm = read_tensor_f32(model, p + "lconv1d.conv_norm.weight");
+    lw.lconv_linear_end = read_clipped_f32(model, p + "lconv1d.linear_end", cl);
+
+    lw.feed_forward2.pre_layer_norm = read_tensor_f32(model, p + "feed_forward2.pre_layer_norm.weight");
+    lw.feed_forward2.ffw_layer_1 = read_clipped_f32(model, p + "feed_forward2.ffw_layer_1", cl);
+    lw.feed_forward2.ffw_layer_2 = read_clipped_f32(model, p + "feed_forward2.ffw_layer_2", cl);
+    lw.feed_forward2.post_layer_norm = read_tensor_f32(model, p + "feed_forward2.post_layer_norm.weight");
+
+    lw.norm_out = read_tensor_f32(model, p + "norm_out.weight");
+  }
+  return w;
+}
+
+Eg2AudioWeightsBf16 load_eg2_audio_weights_bf16(const std::filesystem::path& model_dir) {
+  const Eg2Config cfg = Eg2Config::load(model_dir);
+  SafetensorsModel model(model_dir, SafetensorsOpenMode::SafetensorsOnly);
+  validate_audio_tensors(model, cfg);
+
+  Eg2AudioWeightsBf16 w;
+  w.config = cfg.audio;
+  w.text_hidden_size = cfg.hidden_size;
+  w.sscp_layer0_conv = read_tensor_bf16(model, "audio_tower.subsample_conv_projection.layer0.conv.weight");
+  w.sscp_layer0_norm = read_tensor_bf16(model, "audio_tower.subsample_conv_projection.layer0.norm.weight");
+  w.sscp_layer1_conv = read_tensor_bf16(model, "audio_tower.subsample_conv_projection.layer1.conv.weight");
+  w.sscp_layer1_norm = read_tensor_bf16(model, "audio_tower.subsample_conv_projection.layer1.norm.weight");
+  w.sscp_input_proj_linear = read_tensor_bf16(model, "audio_tower.subsample_conv_projection.input_proj_linear.weight");
+  w.output_proj_weight = read_tensor_bf16(model, "audio_tower.output_proj.weight");
+  w.output_proj_bias = read_tensor_bf16(model, "audio_tower.output_proj.bias");
+  w.embed_audio_projection = read_tensor_bf16(model, "embed_audio.embedding_projection.weight");
+
+  const bool cl = cfg.audio.use_clipped_linears;
+  w.layers.resize(static_cast<std::size_t>(cfg.audio.num_hidden_layers));
+  for (int i = 0; i < cfg.audio.num_hidden_layers; ++i) {
+    const std::string p = "audio_tower.layers." + std::to_string(i) + ".";
+    auto& lw = w.layers[static_cast<std::size_t>(i)];
+    lw.feed_forward1.pre_layer_norm = read_tensor_bf16(model, p + "feed_forward1.pre_layer_norm.weight");
+    lw.feed_forward1.ffw_layer_1 = read_clipped_bf16(model, p + "feed_forward1.ffw_layer_1", cl);
+    lw.feed_forward1.ffw_layer_2 = read_clipped_bf16(model, p + "feed_forward1.ffw_layer_2", cl);
+    lw.feed_forward1.post_layer_norm = read_tensor_bf16(model, p + "feed_forward1.post_layer_norm.weight");
+
+    lw.norm_pre_attn = read_tensor_bf16(model, p + "norm_pre_attn.weight");
+    lw.q_proj = read_clipped_bf16(model, p + "self_attn.q_proj", cl);
+    lw.k_proj = read_clipped_bf16(model, p + "self_attn.k_proj", cl);
+    lw.v_proj = read_clipped_bf16(model, p + "self_attn.v_proj", cl);
+    lw.relative_k_proj = read_tensor_bf16(model, p + "self_attn.relative_k_proj.weight");
+    lw.per_dim_scale = read_tensor_f32(model, p + "self_attn.per_dim_scale");
+    lw.post = read_clipped_bf16(model, p + "self_attn.post", cl);
+    lw.norm_post_attn = read_tensor_bf16(model, p + "norm_post_attn.weight");
+
+    lw.lconv_pre_layer_norm = read_tensor_bf16(model, p + "lconv1d.pre_layer_norm.weight");
+    lw.lconv_linear_start = read_clipped_bf16(model, p + "lconv1d.linear_start", cl);
+    lw.lconv_depthwise_conv1d = read_tensor_bf16(model, p + "lconv1d.depthwise_conv1d.weight");
+    lw.lconv_conv_norm = read_tensor_bf16(model, p + "lconv1d.conv_norm.weight");
+    lw.lconv_linear_end = read_clipped_bf16(model, p + "lconv1d.linear_end", cl);
+
+    lw.feed_forward2.pre_layer_norm = read_tensor_bf16(model, p + "feed_forward2.pre_layer_norm.weight");
+    lw.feed_forward2.ffw_layer_1 = read_clipped_bf16(model, p + "feed_forward2.ffw_layer_1", cl);
+    lw.feed_forward2.ffw_layer_2 = read_clipped_bf16(model, p + "feed_forward2.ffw_layer_2", cl);
+    lw.feed_forward2.post_layer_norm = read_tensor_bf16(model, p + "feed_forward2.post_layer_norm.weight");
+
+    lw.norm_out = read_tensor_bf16(model, p + "norm_out.weight");
+  }
+  return w;
+}
+
 }  // namespace ingine::backends::embedding_gemma2

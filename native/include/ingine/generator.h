@@ -318,11 +318,19 @@ struct EmbeddingImage {
   bool is_video_frame = false;    // true -> expands <|video|>, false -> <|image|>
 };
 
+struct EmbeddingAudio {
+  int sample_rate = 16000;        // Hz (normalized to 16000 Hz mono by decoder)
+  std::vector<float> samples;     // mono PCM normalized to [-1, 1]
+};
+
 struct EmbeddingRequest {
   std::vector<std::vector<std::int32_t>> inputs;  // non-empty batch of non-empty token-id sequences
   // Optional per-item multimodal images / video frames (empty for text-only requests; when non-empty,
   // images.size() == inputs.size() and total soft tokens per item equals <|image|>/<|video|> placeholders).
   std::vector<std::vector<EmbeddingImage>> images;
+  // Optional per-item multimodal audio clips (empty for non-audio requests; when non-empty,
+  // audios.size() == inputs.size() and total audio soft tokens per item equals <|audio|> placeholders).
+  std::vector<std::vector<EmbeddingAudio>> audios;
   EmbeddingPooling pooling = EmbeddingPooling::Mean;
   bool normalize = true;
   // Optional early-exit layer/visit index (0-based). std::nullopt = full forward pass + final norm.

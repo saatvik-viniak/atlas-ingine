@@ -373,9 +373,7 @@ int main(int argc, char** argv) {
         throw std::invalid_argument("embedding_gemma2 does not support Inkling ablation/persona hooks");
       }
       if (!ap.given("--max-ctx")) max_ctx = 8192;
-      // Phase 1 EmbeddingGemma 2 backend serves text embeddings only (vision/audio follow in Phases 2-3).
-      no_vision = true;
-      no_audio = true;
+      // EmbeddingGemma 2 supports text + vision + audio natively; --no-vision / --no-audio opt out cleanly.
     }
     if (is_qwen35) {
       if (loop_passes_explicit) {

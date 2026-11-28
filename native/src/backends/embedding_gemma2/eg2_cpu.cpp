@@ -103,7 +103,8 @@ Eg2CpuEncoder::Eg2CpuEncoder(Eg2TextWeightsF32 weights) : weights_(std::move(wei
 
 std::vector<float> Eg2CpuEncoder::encode_hidden(std::span<const std::int32_t> token_ids,
                                                 std::optional<int> tap_layer,
-                                                std::span<const float> vision_soft_tokens) const {
+                                                std::span<const float> vision_soft_tokens,
+                                                std::span<const float> audio_soft_tokens) const {
   const Eg2Config& cfg = weights_.config;
   const int T = static_cast<int>(token_ids.size());
   if (T <= 0) throw std::invalid_argument("Eg2CpuEncoder::encode_hidden: token_ids must not be empty");
@@ -120,11 +121,16 @@ std::vector<float> Eg2CpuEncoder::encode_hidden(std::span<const std::int32_t> to
   if ((vision_soft_tokens.size() % static_cast<std::size_t>(H)) != 0) {
     throw std::invalid_argument("Eg2CpuEncoder::encode_hidden: vision_soft_tokens length not divisible by hidden_size");
   }
+  if ((audio_soft_tokens.size() % static_cast<std::size_t>(H)) != 0) {
+    throw std::invalid_argument("Eg2CpuEncoder::encode_hidden: audio_soft_tokens length not divisible by hidden_size");
+  }
   const std::size_t n_vision_soft = vision_soft_tokens.size() / static_cast<std::size_t>(H);
+  const std::size_t n_audio_soft = audio_soft_tokens.size() / static_cast<std::size_t>(H);
 
-  // 1. Scaled word embeddings + multimodal soft-token scatter onto <|image|>/<|video|> BEFORE PLE.
+  // 1. Scaled word embeddings + multimodal soft-token scatter onto <|image|>/<|video|>/<|audio|> BEFORE PLE.
   std::vector<float> hidden(static_cast<std::size_t>(T) * static_cast<std::size_t>(H));
   std::size_t vision_cursor = 0;
+  std::size_t audio_cursor = 0;
   for (int t = 0; t < T; ++t) {
     const std::int32_t tid = token_ids[static_cast<std::size_t>(t)];
     if (tid < 0 || tid >= cfg.vocab_size) {
@@ -139,6 +145,13 @@ std::vector<float> Eg2CpuEncoder::encode_hidden(std::span<const std::int32_t> to
       const float* vsrc = vision_soft_tokens.data() + vision_cursor * static_cast<std::size_t>(H);
       std::memcpy(dst, vsrc, static_cast<std::size_t>(H) * sizeof(float));
       ++vision_cursor;
+    } else if (tid == cfg.audio_token_id) {
+      if (audio_cursor >= n_audio_soft) {
+        throw std::invalid_argument("Eg2CpuEncoder: more audio placeholder tokens than audio soft tokens");
+      }
+      const float* asrc = audio_soft_tokens.data() + audio_cursor * static_cast<std::size_t>(H);
+      std::memcpy(dst, asrc, static_cast<std::size_t>(H) * sizeof(float));
+      ++audio_cursor;
     } else {
       const float* src = weights_.embed_tokens.data() + static_cast<std::size_t>(tid) * static_cast<std::size_t>(H);
       for (int d = 0; d < H; ++d) dst[d] = src[d] * embed_scale;
@@ -147,6 +160,10 @@ std::vector<float> Eg2CpuEncoder::encode_hidden(std::span<const std::int32_t> to
   if (vision_cursor != n_vision_soft) {
     throw std::invalid_argument("Eg2CpuEncoder: vision soft token count (" + std::to_string(n_vision_soft) +
                                 ") does not match image/video placeholder tokens (" + std::to_string(vision_cursor) + ")");
+  }
+  if (audio_cursor != n_audio_soft) {
+    throw std::invalid_argument("Eg2CpuEncoder: audio soft token count (" + std::to_string(n_audio_soft) +
+                                ") does not match audio placeholder tokens (" + std::to_string(audio_cursor) + ")");
   }
 
   // 2. Projection-only PLE: [T, L * H] -> RMSNorm across each [H] slice
@@ -269,11 +286,15 @@ std::vector<float> Eg2CpuEncoder::encode_hidden(std::span<const std::int32_t> to
 
 ingine::model::EmbeddingResult Eg2CpuEncoder::embed(const ingine::model::EmbeddingRequest& req,
                                                     const PlatosKey* platos_key,
-                                                    const Eg2CpuVisionEncoder* vision_encoder) const {
+                                                    const Eg2CpuVisionEncoder* vision_encoder,
+                                                    const Eg2CpuAudioEncoder* audio_encoder) const {
   const Eg2Config& cfg = weights_.config;
   if (req.inputs.empty()) throw std::invalid_argument("Eg2CpuEncoder::embed: inputs must not be empty");
   if (!req.images.empty() && req.images.size() != req.inputs.size()) {
     throw std::invalid_argument("Eg2CpuEncoder::embed: images batch size must match inputs batch size");
+  }
+  if (!req.audios.empty() && req.audios.size() != req.inputs.size()) {
+    throw std::invalid_argument("Eg2CpuEncoder::embed: audios batch size must match inputs batch size");
   }
   if (req.tap_layer.has_value() && (*req.tap_layer < 0 || *req.tap_layer >= cfg.num_hidden_layers)) {
     throw std::invalid_argument("Eg2CpuEncoder::embed: tap_layer out of range");
@@ -304,7 +325,17 @@ ingine::model::EmbeddingResult Eg2CpuEncoder::embed(const ingine::model::Embeddi
         item_vision_soft.insert(item_vision_soft.end(), soft.begin(), soft.end());
       }
     }
-    const std::vector<float> h = encode_hidden(seq, req.tap_layer, item_vision_soft);
+    std::vector<float> item_audio_soft;
+    if (!req.audios.empty() && !req.audios[static_cast<std::size_t>(b)].empty()) {
+      if (audio_encoder == nullptr) {
+        throw std::invalid_argument("EmbeddingGemma2: audio input rejected because audio tower is disabled (--no-audio)");
+      }
+      for (const auto& aud : req.audios[static_cast<std::size_t>(b)]) {
+        const std::vector<float> soft = audio_encoder->encode_audio(aud);
+        item_audio_soft.insert(item_audio_soft.end(), soft.begin(), soft.end());
+      }
+    }
+    const std::vector<float> h = encode_hidden(seq, req.tap_layer, item_vision_soft, item_audio_soft);
     const int T = static_cast<int>(seq.size());
     float* dst = pooled_h.data() + static_cast<std::size_t>(b) * static_cast<std::size_t>(H);
     if (req.pooling == model::EmbeddingPooling::Cls) {
@@ -392,6 +423,9 @@ Eg2CpuBackend::Eg2CpuBackend(const ingine::model::RuntimeOptions& options)
   if (options.vision && encoder_.config().has_vision_config) {
     vision_encoder_ = std::make_unique<Eg2CpuVisionEncoder>(load_eg2_vision_weights_f32(options.model_dir));
   }
+  if (options.audio && encoder_.config().has_audio_config) {
+    audio_encoder_ = std::make_unique<Eg2CpuAudioEncoder>(load_eg2_audio_weights_f32(options.model_dir));
+  }
   if (!options.platos_key.empty()) {
     platos_key_ = PlatosKey::load(options.platos_key, options.platos_key_metadata, 0);
   }
@@ -410,7 +444,7 @@ void Eg2CpuBackend::init_metadata() {
   caps_.architecture = !cfg.architectures.empty() ? cfg.architectures.front() : "EmbeddingGemma2Model";
   caps_.supports_text = true;
   caps_.supports_images = (vision_encoder_ != nullptr);
-  caps_.supports_audio = false;
+  caps_.supports_audio = (audio_encoder_ != nullptr);
   caps_.max_supported_batch = 64;
   caps_.supported_gears = {"encoder_f32"};
   caps_.supported_kv_cache_modes = {"none"};
@@ -456,7 +490,7 @@ ingine::model::EmbeddingResult Eg2CpuBackend::embed(const ingine::model::Embeddi
                                   " exceeds max_ctx " + std::to_string(max_ctx_));
     }
   }
-  return encoder_.embed(req, platos_key_.get(), vision_encoder_.get());
+  return encoder_.embed(req, platos_key_.get(), vision_encoder_.get(), audio_encoder_.get());
 }
 
 void register_eg2_cpu_backend() {

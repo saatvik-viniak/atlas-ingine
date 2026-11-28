@@ -1,5 +1,7 @@
 #include "serve/openai.h"
 
+#include "backends/embedding_gemma2/eg2_audio.h"
+
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -710,7 +712,9 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
   };
 
   bool any_images = false;
+  bool any_audios = false;
   std::vector<std::vector<model::EmbeddingImage>> per_item_images;
+  std::vector<std::vector<model::EmbeddingAudio>> per_item_audios;
 
   auto encode_text_item = [&](const std::string& text, const char* where_desc) {
     if (text.empty()) {
@@ -734,6 +738,7 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
     }
     out.request.inputs.push_back(std::move(ids));
     per_item_images.emplace_back();
+    per_item_audios.emplace_back();
   };
 
   auto encode_parts_item = [&](const Json& parts, const char* where_desc) {
@@ -742,6 +747,7 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
     }
     std::vector<int32_t> ids;
     std::vector<model::EmbeddingImage> item_imgs;
+    std::vector<model::EmbeddingAudio> item_auds;
     bool has_text = false;
     bool prefix_applied = false;
     if (wrap_bos_eos && fmt.tokenizer().bos_token_id().has_value()) {
@@ -749,8 +755,11 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
     }
 
     constexpr int32_t kBoi = 255999;
+    constexpr int32_t kBoa = 256000;
     constexpr int32_t kImgTok = 258880;
+    constexpr int32_t kAudTok = 258881;
     constexpr int32_t kEoi = 258882;
+    constexpr int32_t kEoa = 258883;
     constexpr int32_t kVidTok = 258884;
 
     for (std::size_t pi = 0; pi < parts.size(); ++pi) {
@@ -858,7 +867,57 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
         if (!opts.supports_audio) {
           throw BadRequest("audio inputs are not enabled on this server (started without audio or --no-audio)", "input");
         }
-        throw BadRequest("audio embedding input parsing is not yet enabled", "input");
+        if (!wrap_bos_eos) {
+          throw BadRequest("multimodal audio embeddings are only supported on multimodal encoder models", "input");
+        }
+        std::string audio_payload;
+        if (const Json* ia = get(part, "input_audio")) {
+          if (ia->is_object()) {
+            if (const Json* fmt_j = get(*ia, "format")) {
+              if (!fmt_j->is_string() || fmt_j->get_ref<const std::string&>() != "wav") {
+                throw BadRequest("audio input 'format' must be 'wav'", "input");
+              }
+            }
+            if (const Json* d = get(*ia, "data"); d && d->is_string()) {
+              audio_payload = d->get<std::string>();
+            }
+          } else if (ia->is_string()) {
+            audio_payload = ia->get<std::string>();
+          }
+        }
+        if (audio_payload.empty()) {
+          if (const Json* d = get(part, "data"); d && d->is_string()) {
+            audio_payload = d->get<std::string>();
+          } else if (const Json* au = get(part, "audio_url")) {
+            if (au->is_string()) {
+              audio_payload = au->get<std::string>();
+            } else if (au->is_object()) {
+              if (const Json* u = get(*au, "url"); u && u->is_string()) audio_payload = u->get<std::string>();
+            }
+          } else if (const Json* a = get(part, "audio"); a && a->is_string()) {
+            audio_payload = a->get<std::string>();
+          } else if (const Json* u = get(part, "url"); u && u->is_string()) {
+            audio_payload = u->get<std::string>();
+          }
+        }
+        if (audio_payload.empty()) {
+          throw BadRequest(std::string(where_desc) + "[" + std::to_string(pi) +
+                               "] missing audio payload ('input_audio.data', 'data', or 'audio_url')",
+                           "input");
+        }
+        model::EmbeddingAudio decoded_audio;
+        int n_aud_soft = 0;
+        try {
+          decoded_audio = backends::embedding_gemma2::eg2_decode_wav_base64_or_data_uri(audio_payload);
+          n_aud_soft = backends::embedding_gemma2::eg2_preprocess_audio(decoded_audio).num_valid_tokens;
+        } catch (const std::invalid_argument& e) {
+          throw BadRequest(e.what(), "input");
+        }
+        ids.push_back(kBoa);
+        ids.insert(ids.end(), static_cast<std::size_t>(n_aud_soft), kAudTok);
+        ids.push_back(kEoa);
+        item_auds.push_back(std::move(decoded_audio));
+        any_audios = true;
       } else {
         throw BadRequest(std::string(where_desc) + "[" + std::to_string(pi) + "] unsupported content part type '" +
                              ptype + "'",
@@ -882,6 +941,7 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
     }
     out.request.inputs.push_back(std::move(ids));
     per_item_images.push_back(std::move(item_imgs));
+    per_item_audios.push_back(std::move(item_auds));
   };
 
   if (inp->is_string()) {
@@ -894,6 +954,7 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
     } else {
       out.request.inputs.reserve(inp->size());
       per_item_images.reserve(inp->size());
+      per_item_audios.reserve(inp->size());
       for (std::size_t i = 0; i < inp->size(); ++i) {
         const Json& elem = (*inp)[i];
         const std::string desc = "'input[" + std::to_string(i) + "]'";
@@ -911,6 +972,9 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
   }
   if (any_images) {
     out.request.images = std::move(per_item_images);
+  }
+  if (any_audios) {
+    out.request.audios = std::move(per_item_audios);
   }
 
   if (const Json* ef = get(body, "encoding_format")) {

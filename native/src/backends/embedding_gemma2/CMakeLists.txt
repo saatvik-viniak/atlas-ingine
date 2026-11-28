@@ -2,6 +2,7 @@ add_library(ingine_eg2_cpu STATIC
   eg2_config.cpp
   eg2_manifest.cpp
   eg2_vision.cpp
+  eg2_audio.cpp
   eg2_cpu.cpp
 )
 

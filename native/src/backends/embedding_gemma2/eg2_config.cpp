@@ -78,6 +78,28 @@ Eg2Config Eg2Config::parse(std::string_view config_json, std::string_view st_con
       cfg.vision.rope_theta = rp->value("rope_theta", cfg.vision.rope_theta);
     }
   }
+  if (cfg.has_audio_config) {
+    const nlohmann::json& ac = root["audio_config"];
+    cfg.audio.hidden_size = ac.value("hidden_size", cfg.audio.hidden_size);
+    cfg.audio.num_hidden_layers = ac.value("num_hidden_layers", cfg.audio.num_hidden_layers);
+    cfg.audio.num_attention_heads = ac.value("num_attention_heads", cfg.audio.num_attention_heads);
+    cfg.audio.output_proj_dims = ac.value("output_proj_dims", cfg.audio.output_proj_dims);
+    cfg.audio.conv_kernel_size = ac.value("conv_kernel_size", cfg.audio.conv_kernel_size);
+    cfg.audio.attention_chunk_size = ac.value("attention_chunk_size", cfg.audio.attention_chunk_size);
+    cfg.audio.attention_context_left = ac.value("attention_context_left", cfg.audio.attention_context_left);
+    cfg.audio.attention_context_right = ac.value("attention_context_right", cfg.audio.attention_context_right);
+    cfg.audio.attention_logit_cap = ac.value("attention_logit_cap", cfg.audio.attention_logit_cap);
+    cfg.audio.attention_invalid_logits_value =
+        ac.value("attention_invalid_logits_value", cfg.audio.attention_invalid_logits_value);
+    cfg.audio.gradient_clipping = ac.value("gradient_clipping", cfg.audio.gradient_clipping);
+    cfg.audio.residual_weight = ac.value("residual_weight", cfg.audio.residual_weight);
+    cfg.audio.rms_norm_eps = ac.value("rms_norm_eps", cfg.audio.rms_norm_eps);
+    cfg.audio.use_clipped_linears = ac.value("use_clipped_linears", cfg.audio.use_clipped_linears);
+    if (auto sc = ac.find("subsampling_conv_channels"); sc != ac.end() && sc->is_array() && sc->size() >= 2) {
+      cfg.audio.sscp_conv_channels_0 = (*sc)[0].get<int>();
+      cfg.audio.sscp_conv_channels_1 = (*sc)[1].get<int>();
+    }
+  }
 
   const nlohmann::json& tc = root.contains("text_config") && root["text_config"].is_object() ? root["text_config"] : root;
   cfg.vocab_size = tc.value("vocab_size", cfg.vocab_size);
