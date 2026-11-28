@@ -4,6 +4,7 @@
 #include "core/act.h"
 #include "core/arena.h"
 #include "ingine/generator.h"
+#include "ingine/platos_key.h"
 #include "kernels/common/persona_abi.h"
 #include "model/model_data.h"
 
@@ -50,10 +51,24 @@ class Prefiller {
   void run(State& state, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
            std::span<const EmbedRows> rows = {}, const kernels::persona::PersonaDeviceTable* hooks = nullptr);
 
+  // Zero-KV, no-lm_head batched embedding prefill over one or more token sequences.
+  // Packs multi-string inputs with len <= max_chunk_ into compute-bound GEMM batches using only
+  // Prefiller's ephemeral scratch (zero persistent KV allocation, never touches chat State or paged KV).
+  // Supports early-exit `tap_layer` (0..num_visits-1, matching TAP_VISITS hid tensors) and in-GPU
+  // Plato's Key projection. Sequences longer than max_chunk_ fall back to a transient local state
+  // that is freed before return so active chat KV remains untouched.
+  EmbeddingResult embed(const EmbeddingRequest& req, int max_ctx, const PlatosKeyGpu* platos_key = nullptr);
+
   int max_chunk() const { return max_chunk_; }
+  int num_visits() const { return make_visit_plan(loop_passes_).num_visits; }
   std::size_t device_bytes() const;  // scratch held by this object
 
  private:
+  void run_embed_packed(const std::int32_t* d_tokens, std::span<const int> seq_lens,
+                        const std::int32_t* d_seq_offsets, EmbeddingPooling pooling, std::optional<int> tap_visit,
+                        bool l2_normalize, float* d_out_pooled);
+  void run_embed_chunk(State& state, const std::int32_t* d_tokens, int T, int pos0, std::optional<int> tap_visit,
+                       float* d_out_f32, bool* out_is_act);
   const float* const* block_table(const std::vector<const float*>& blocks);
 
   const Weights& w_;
@@ -84,8 +99,14 @@ class Prefiller {
   ActT* wscratch_;  // dequantized FP8 rows of wproj / wo (dense_fp8)
   float* logits_weak_ = nullptr;    // [UNPADDED_VOCAB] scratch when loopcd_mode_ == LogitsAdaptive
   float* loopcd_reduce_ = nullptr;  // [kLoopCdReduceFloatsPerRow] scratch when loopcd_mode_ == LogitsAdaptive
+  float* zero_conv_ = nullptr;      // [3 * H] read-only zero buffer for stateless zero-KV embedding convs
   std::int64_t* ids_;
   int kpos_rows_;
+  // Lazily allocated tiny device staging for embed() calls (token ids, seq offsets, pooled/projected rows).
+  DeviceBuffer embed_toks_dev_;
+  DeviceBuffer embed_offsets_dev_;
+  DeviceBuffer embed_pooled_dev_;
+  DeviceBuffer embed_proj_dev_;
 };
 
 }  // namespace ingine::model

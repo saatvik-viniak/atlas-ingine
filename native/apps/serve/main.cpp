@@ -99,6 +99,7 @@ int main(int argc, char** argv) {
   std::string attn_requant = "off";
   std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1", cache_namespace_header;
   std::string warm_start_prompt, warm_start_file, warm_start_namespace;
+  std::string platos_key, platos_key_metadata;
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1,
       park_host_mb = 0;
   int max_batch = 1, max_kv_tokens = 0, loop_passes = 3;
@@ -198,6 +199,12 @@ int main(int argc, char** argv) {
             "prefix-cache namespace for startup warm-start (required when combining warm-start with --cache-namespace-header)",
             &warm_start_namespace);
   ap.exclusive({"--warm-start-prompt", "--warm-start-file"}, false);
+  ap.option("--platos-key", "",
+            "optional Plato's Key .safetensors projection for POST /v1/embeddings (enabled per-request via platos_key=true)",
+            &platos_key);
+  ap.option("--platos-key-metadata", "",
+            "optional sidecar JSON metadata file validated against --platos-key tensor dimensions",
+            &platos_key_metadata);
   ap.flag("--no-vision", "text only: do not load the vision tower (saves 0.6 GB) and reject requests with images",
           &no_vision);
   ap.option("--image-max-tokens", "",
@@ -296,6 +303,10 @@ int main(int argc, char** argv) {
     std::cerr << "ingine-serve: error: --warm-start-namespace requires --warm-start-prompt or --warm-start-file\n";
     return 2;
   }
+  if (!platos_key_metadata.empty() && platos_key.empty()) {
+    std::cerr << "ingine-serve: error: --platos-key-metadata requires --platos-key\n";
+    return 2;
+  }
 
   auto& log = ingine::engine::server_log();
   if (!ingine::engine::set_log_level(log_level)) {
@@ -381,6 +392,9 @@ int main(int argc, char** argv) {
         qfake->set_model_family("qwen3_5");
         qfake->set_supports_logit_masker(false);
         qfake->set_supports_images(false);
+        qfake->set_embedding_dim(5120);
+        qfake->set_num_tap_layers(64);
+        if (!platos_key.empty()) qfake->load_platos_key(platos_key, platos_key_metadata);
         generator = std::move(qfake);
       } else {
         if (loop_passes != 3) {
@@ -444,6 +458,9 @@ int main(int argc, char** argv) {
             fmt.tokenizer(), "Inkling-2-Mini-fake", tokenizer_max_length(model_dir),
             ingine::engine::FakeGenerator::Responder{}, fake_delay, loop_passes, parsed_kv_mode, fake_allow_last_full);
         ifake->set_loopcd_mode(parsed_loopcd_mode);
+        ifake->set_embedding_dim(2304);
+        ifake->set_num_tap_layers(6 + loop_passes * 12 + 6);
+        if (!platos_key.empty()) ifake->load_platos_key(platos_key, platos_key_metadata);
         generator = std::move(ifake);
       }
     } else {
@@ -498,6 +515,8 @@ int main(int argc, char** argv) {
       options.expert_swaps = expert_swaps;
       options.enable_persona_hooks = (personas != nullptr) || persona_probe_mode;
       options.refusal_map = refusal_map;
+      options.platos_key = platos_key;
+      options.platos_key_metadata = platos_key_metadata;
       generator = ingine::model::make_generator(options);
 #if defined(__linux__)
       maybe_log_gpu_unlock_notice(log);
@@ -539,9 +558,14 @@ int main(int argc, char** argv) {
                                     ? fmt::format("on (at most {} tokens per image, {} images and {} image tokens per request)",
                                                   image_max_tokens, max_images, max_image_tokens)
                                     : std::string("off"));
-    log.info("serving {} on http://{}:{}/v1 (kv_cache_mode={}, loop_passes={}, loopcd={})", server.model_id(), host,
-             server.port(), ingine::model::to_string(generator->kv_cache_mode()), generator->loop_passes(),
-             ingine::model::to_string(generator->loopcd_mode()));
+    log.info("serving {} on http://{}:{}/v1 (kv_cache_mode={}, loop_passes={}, loopcd={}, embeddings={}, platos_key={})",
+             server.model_id(), host, server.port(), ingine::model::to_string(generator->kv_cache_mode()),
+             generator->loop_passes(), ingine::model::to_string(generator->loopcd_mode()),
+             generator->supports_embeddings() ? fmt::format("on(dim={},taps={})", generator->embedding_dim(),
+                                                            generator->num_tap_layers())
+                                              : std::string("off"),
+             generator->has_platos_key() ? fmt::format("on(out_dim={})", generator->platos_key_out_dim())
+                                         : std::string("off"));
     bool listened = true;
     std::thread listener([&] {
       listened = server.listen();

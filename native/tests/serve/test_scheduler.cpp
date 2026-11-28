@@ -161,6 +161,62 @@ void test_prefill_stats_before_first_token() {
   drain(*j);
 }
 
+class EmbedFairnessGenerator final : public ingine::model::Generator {
+ public:
+  std::string model_id() const override { return "embed-fair"; }
+  int max_model_len() const override { return 1 << 20; }
+  bool supports_embeddings() const override { return true; }
+  int embedding_dim() const override { return 4; }
+  int num_tap_layers() const override { return 8; }
+  GenerateStats generate(std::span<const int32_t> prompt, int, const Sampling&, std::span<const int32_t>,
+                         const std::function<bool(std::span<const int32_t>)>& on_tokens) override {
+    events.push_back(prompt[0]);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const int32_t tok = 42;
+    on_tokens(std::span<const int32_t>(&tok, 1));
+    return {};
+  }
+  ingine::model::EmbeddingResult embed(const ingine::model::EmbeddingRequest& req) override {
+    events.push_back(-req.inputs[0][0]);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    ingine::model::EmbeddingResult res;
+    res.embeddings.push_back({1.0f, 0.0f, 0.0f, 0.0f});
+    res.stats.total_prompt_tokens = int(req.inputs[0].size());
+    res.stats.output_dim = 4;
+    res.stats.kv_slots_allocated = 0;
+    res.stats.lm_head_skipped = true;
+    return res;
+  }
+  std::vector<int32_t> events;
+};
+
+void test_embedding_fair_interleaving_and_close() {
+  EmbedFairnessGenerator gen;
+  Scheduler s(gen, {}, 4);
+  auto c1 = std::make_shared<Job>(std::vector<int32_t>{1}, 1, Sampling{});
+  auto c2 = std::make_shared<Job>(std::vector<int32_t>{2}, 1, Sampling{});
+  ingine::model::EmbeddingRequest er1;
+  er1.inputs = {{10}};
+  ingine::model::EmbeddingRequest er2;
+  er2.inputs = {{20}};
+  auto e1 = std::make_shared<ingine::engine::EmbeddingJob>(er1);
+  auto e2 = std::make_shared<ingine::engine::EmbeddingJob>(er2);
+  CHECK(s.submit(c1));
+  CHECK(s.submit(c2));
+  CHECK(s.submit_embedding(e1));
+  CHECK(s.submit_embedding(e2));
+  CHECK(drain(*c1).size() == 1);
+  CHECK(drain(*c2).size() == 1);
+  CHECK(e1->wait(std::chrono::seconds(5)) && e1->result().has_value());
+  CHECK(e2->wait(std::chrono::seconds(5)) && e2->result().has_value());
+  CHECK(e1->result()->stats.kv_slots_allocated == 0);
+  CHECK(e1->result()->stats.lm_head_skipped);
+  CHECK(gen.events.size() == 4);
+  s.close();
+  auto e3 = std::make_shared<ingine::engine::EmbeddingJob>(er1);
+  CHECK(!s.submit_embedding(e3));
+}
+
 }  // namespace
 
 int main() {
@@ -168,6 +224,7 @@ int main() {
   test_cancel_fifo_bound();
   test_failure_and_close();
   test_prefill_stats_before_first_token();
+  test_embedding_fair_interleaving_and_close();
   std::printf(g_failures ? "FAILED (%d checks)\n" : "ok\n", g_failures);
   return g_failures ? 1 : 0;
 }

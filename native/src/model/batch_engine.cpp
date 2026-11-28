@@ -10,6 +10,7 @@
 #include "core/ops.h"
 #include "core/safetensors.h"
 #include "ingine/batch_spec_plan.h"
+#include "ingine/platos_key.h"
 #include "kernels/batch/batch.h"
 #include "kernels/dense/dense.h"
 #include "kernels/draft/batch_draft.h"
@@ -2164,6 +2165,20 @@ class BatchGenerator final : public Generator {
     return generate_from_slots(full_prompt, max_new_tokens, sampling, stop_ids, on_tokens, on_prefill);
   }
 
+  bool supports_embeddings() const override { return true; }
+  int embedding_dim() const override { return HIDDEN; }
+  int num_tap_layers() const override { return prefiller_ ? prefiller_->num_visits() : NUM_VISITS; }
+  bool has_platos_key() const override { return platos_key_gpu_ != nullptr; }
+  int platos_key_out_dim() const override { return platos_key_gpu_ ? platos_key_gpu_->out_dim() : 0; }
+  std::string platos_key_tap_spec() const override {
+    return platos_key_gpu_ ? platos_key_gpu_->metadata().tap_spec : "";
+  }
+  EmbeddingResult embed(const EmbeddingRequest& req) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Stateless zero-KV embedding prefill: never allocates a batch slot or touches pool_/prefix_cache_.
+    return prefiller_->embed(req, options_.max_ctx, platos_key_gpu_.get());
+  }
+
  private:
   struct SlotMeta {
     head::SamplingParams params{};
@@ -2410,6 +2425,9 @@ class BatchGenerator final : public Generator {
       }
     }
     if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, stream_);
+    if (!options_.platos_key.empty()) {
+      platos_key_gpu_ = PlatosKeyGpu::load(options_.platos_key, options_.platos_key_metadata, HIDDEN, stream_);
+    }
     prefiller_ = std::make_unique<Prefiller>(weights_, ablation_, prefill_chunk_, stream_);
     chunk_tokens_ = DeviceBuffer(std::size_t(prefill_chunk_) * sizeof(std::int32_t));
     prefill_logits_ = DeviceBuffer(std::size_t(UNPADDED_VOCAB) * sizeof(float));
@@ -2554,6 +2572,7 @@ class BatchGenerator final : public Generator {
   int max_verify_width_ = 1;
   std::size_t free_at_entry_ = 0;
   std::unique_ptr<VisionEncoder> vision_;
+  std::shared_ptr<const PlatosKeyGpu> platos_key_gpu_;
   std::unique_ptr<Prefiller> prefiller_;
   std::unique_ptr<BatchDrafter> drafter_;
   BatchStatePool pool_;

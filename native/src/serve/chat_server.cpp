@@ -181,6 +181,12 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
       loop_passes_(generator.loop_passes()),
       loopcd_mode_(generator.loopcd_mode()),
       supports_logit_masker_(generator.supports_logit_masker()),
+      supports_embeddings_(generator.supports_embeddings()),
+      embedding_dim_(generator.embedding_dim()),
+      num_tap_layers_(generator.num_tap_layers()),
+      has_platos_key_(generator.has_platos_key()),
+      platos_key_out_dim_(generator.platos_key_out_dim()),
+      platos_key_tap_spec_(generator.platos_key_tap_spec()),
       sampling_defaults_(options.sampling),
       image_options_([&] {
         ImageOptions images = options.images;
@@ -249,19 +255,26 @@ Json ChatServer::supported_kv_cache_modes_json() const {
 }
 
 Json ChatServer::model_card() const {
-  return Json{{"id", model_id_},
-              {"object", "model"},
-              {"created", created_},
-              {"owned_by", "ingine"},
-              {"model_family", model_family_},
-              {"max_model_len", max_model_len_},
-              {"kv_cache_mode", model::to_string(kv_cache_mode_)},
-              {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
-              {"kv_cache_mode_mutable", false},
-              {"loop_passes", loop_passes_},
-              {"loopcd", model::to_string(loopcd_mode_)},
-              {"supports_structured_output", supports_logit_masker_},
-              {"input_modalities", image_options_.enabled ? Json::array({"text", "image"}) : Json::array({"text"})}};
+  Json card{{"id", model_id_},
+            {"object", "model"},
+            {"created", created_},
+            {"owned_by", "ingine"},
+            {"model_family", model_family_},
+            {"max_model_len", max_model_len_},
+            {"kv_cache_mode", model::to_string(kv_cache_mode_)},
+            {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
+            {"kv_cache_mode_mutable", false},
+            {"loop_passes", loop_passes_},
+            {"loopcd", model::to_string(loopcd_mode_)},
+            {"supports_structured_output", supports_logit_masker_},
+            {"supports_embeddings", supports_embeddings_},
+            {"embedding_dim", embedding_dim_},
+            {"num_tap_layers", num_tap_layers_},
+            {"platos_key_loaded", has_platos_key_},
+            {"platos_key_out_dim", platos_key_out_dim_},
+            {"input_modalities", image_options_.enabled ? Json::array({"text", "image"}) : Json::array({"text"})}};
+  if (!platos_key_tap_spec_.empty()) card["platos_key_tap_spec"] = platos_key_tap_spec_;
+  return card;
 }
 
 Json ChatServer::personas_list() const {
@@ -298,23 +311,31 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
     res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
     res.set_header("X-Ingine-LoopCD", model::to_string(loopcd_mode_));
-    send_json(res, 200,
-              Json{{"status", "ok"},
-                   {"model", model_id_},
-                   {"model_family", model_family_},
-                   {"kv_cache_mode", model::to_string(kv_cache_mode_)},
-                   {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
-                   {"kv_cache_mode_mutable", false},
-                   {"loop_passes", loop_passes_},
-                   {"loopcd", model::to_string(loopcd_mode_)},
-                   {"supports_structured_output", supports_logit_masker_},
-                   {"warm_start", warm_start_},
-                   {"warm_start_tokens", warm_start_tokens_},
-                   {"waiting", st.waiting},
-                   {"running", st.running},
-                   {"active", st.active},
-                   {"max_batch", st.max_batch},
-                   {"max_queue", st.max_queue}});
+    Json health{{"status", "ok"},
+                {"model", model_id_},
+                {"model_family", model_family_},
+                {"kv_cache_mode", model::to_string(kv_cache_mode_)},
+                {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
+                {"kv_cache_mode_mutable", false},
+                {"loop_passes", loop_passes_},
+                {"loopcd", model::to_string(loopcd_mode_)},
+                {"supports_structured_output", supports_logit_masker_},
+                {"supports_embeddings", supports_embeddings_},
+                {"embedding_dim", embedding_dim_},
+                {"num_tap_layers", num_tap_layers_},
+                {"platos_key_loaded", has_platos_key_},
+                {"platos_key_out_dim", platos_key_out_dim_},
+                {"warm_start", warm_start_},
+                {"warm_start_tokens", warm_start_tokens_},
+                {"waiting", st.waiting},
+                {"running", st.running},
+                {"active", st.active},
+                {"embed_waiting", st.embed_waiting},
+                {"embed_running", st.embed_running},
+                {"max_batch", st.max_batch},
+                {"max_queue", st.max_queue}};
+    if (!platos_key_tap_spec_.empty()) health["platos_key_tap_spec"] = platos_key_tap_spec_;
+    send_json(res, 200, health);
   } else if (path == "/v1/models") {
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
     res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
@@ -335,9 +356,10 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
 void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res) {
   const std::string path = route_path(req);
   const bool is_openai = (path == "/v1/chat/completions");
+  const bool is_embeddings = (path == "/v1/embeddings");
   const bool is_anthropic = (path == "/v1/messages");
   const bool is_anthropic_count = (path == "/v1/messages/count_tokens");
-  if (!is_openai && !is_anthropic && !is_anthropic_count) {
+  if (!is_openai && !is_embeddings && !is_anthropic && !is_anthropic_count) {
     send_error(res, 404, "no route for POST " + path);
     return;
   }
@@ -348,6 +370,32 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
   if (!req.has_header("Content-Length")) {
     res.set_header("Connection", "close");
     fail_post(411, "Content-Length required");
+    return;
+  }
+  if (is_embeddings) {
+    if (!supports_embeddings_) {
+      send_error(res, 400, "embeddings are not supported by this model backend");
+      return;
+    }
+    ParsedEmbeddingRequest emb_req;
+    try {
+      Json body;
+      try {
+        body = Json::parse(req.body);
+      } catch (const Json::parse_error& e) {
+        send_error(res, 400, std::string("invalid JSON body: ") + e.what());
+        return;
+      }
+      if (!body.is_object()) throw BadRequest("request body must be a JSON object");
+      emb_req = parse_embedding_request(body, fmt_, max_model_len_, num_tap_layers_, has_platos_key_);
+    } catch (const BadRequest& e) {
+      send_error(res, e.status, e.what(), e.param);
+      return;
+    } catch (const text::ChatError& e) {
+      send_error(res, 400, e.what(), e.param);
+      return;
+    }
+    complete_embedding(req, res, std::move(emb_req));
     return;
   }
   if (req.has_header("X-Ingine-Expected-Loop-Passes")) {
@@ -765,6 +813,52 @@ void ChatServer::complete_anthropic(const httplib::Request& req, httplib::Respon
       [this, state](bool success) {
         if (!success || !state->started.load(std::memory_order_acquire)) scheduler_.withdraw(state->x->job);
       });
+}
+
+void ChatServer::complete_embedding(const httplib::Request& req, httplib::Response& res,
+                                    ParsedEmbeddingRequest parsed) {
+  const EmbeddingEncodingFormat encoding_format = parsed.encoding_format;
+  auto job = std::make_shared<engine::EmbeddingJob>(std::move(parsed.request));
+  if (!scheduler_.submit_embedding(job)) {
+    res.set_header("Retry-After", "1");
+    send_error(res, 503, "server busy: embedding request queue is full");
+    return;
+  }
+  while (!job->wait(kPollInterval)) {
+    if (req.is_connection_closed()) {
+      scheduler_.withdraw_embedding(job);
+      engine::server_log().info("{}: embedding client disconnected; cancelled", job->id);
+      res.set_header("Connection", "close");
+      send_error(res, 500, "client disconnected");
+      return;
+    }
+  }
+  if (job->failure()) {
+    send_error(res, 500, *job->failure());
+    return;
+  }
+  const model::EmbeddingResult& result = *job->result();
+  const double total_s = seconds(Clock::now() - job->t_submit);
+  const double queued_s = seconds(job->t_start().value_or(Clock::now()) - job->t_submit);
+  engine::server_log().info(
+      "{}: embeddings batch={} tokens={} dim={} tap={} platos_key={} prefill_ms={:.2f} pk_ms={:.3f} "
+      "kv_slots={} lm_head_skipped={} queued={:.3f}s total={:.3f}s",
+      job->id, result.embeddings.size(), result.stats.total_prompt_tokens, result.stats.output_dim,
+      result.stats.effective_tap_layer >= 0 ? std::to_string(result.stats.effective_tap_layer) : std::string("full"),
+      job->request.use_platos_key ? "true" : "false", result.stats.prefill_seconds * 1e3,
+      result.stats.platos_key_seconds * 1e3, result.stats.kv_slots_allocated,
+      result.stats.lm_head_skipped ? "true" : "false", queued_s, total_s);
+
+  res.set_header("X-Ingine-Kv-Slots-Allocated", std::to_string(result.stats.kv_slots_allocated));
+  res.set_header("X-Ingine-Lm-Head-Skipped", result.stats.lm_head_skipped ? "true" : "false");
+  res.set_header("X-Ingine-Tap-Layer", result.stats.effective_tap_layer >= 0
+                                           ? std::to_string(result.stats.effective_tap_layer)
+                                           : "full");
+  res.set_header("X-Ingine-Platos-Key", job->request.use_platos_key ? "true" : "false");
+  if (job->request.use_platos_key) {
+    res.set_header("X-Ingine-Platos-Key-Ms", fmt::format("{:.4f}", result.stats.platos_key_seconds * 1e3));
+  }
+  send_json(res, 200, embedding_response_json(model_id_, result, encoding_format));
 }
 
 bool ChatServer::bind(const std::string& host, int port) {

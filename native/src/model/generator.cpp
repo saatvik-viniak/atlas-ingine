@@ -13,6 +13,7 @@
 //      during cold prefill and are never erased as "superseded" by longer child extensions.
 //   4. Optional disk KV checkpoint resume (`kv_ckpt_resume` / `kv_ckpt_path`).
 #include "ingine/generator.h"
+#include "ingine/platos_key.h"
 
 #include "backends/qwen38/qwen38_dense_gpu.h"
 #include "backends/qwen4exp/qwen4exp_gpu.h"
@@ -146,6 +147,19 @@ class EngineGenerator final : public Generator {
   int max_model_len() const override { return options_.max_ctx; }
 
   bool supports_images() const override { return vision_ != nullptr; }
+  bool supports_embeddings() const override { return true; }
+  int embedding_dim() const override { return HIDDEN; }
+  int num_tap_layers() const override { return prefiller_.num_visits(); }
+  bool has_platos_key() const override { return platos_key_gpu_ != nullptr; }
+  int platos_key_out_dim() const override { return platos_key_gpu_ ? platos_key_gpu_->out_dim() : 0; }
+  std::string platos_key_tap_spec() const override {
+    return platos_key_gpu_ ? platos_key_gpu_->metadata().tap_spec : "";
+  }
+  EmbeddingResult embed(const EmbeddingRequest& req) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Stateless zero-KV embedding prefill: never reads or writes rt_.state(), checkpoint_, or parked_.
+    return prefiller_.embed(req, options_.max_ctx, platos_key_gpu_.get());
+  }
 
   PrefixCacheStats cache_stats() const override {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -257,6 +271,9 @@ class EngineGenerator final : public Generator {
 
     // the vision tower's weights are resident: loaded before the park budget below is measured
     if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, rt_.stream());
+    if (!options_.platos_key.empty()) {
+      platos_key_gpu_ = PlatosKeyGpu::load(options_.platos_key, options_.platos_key_metadata, HIDDEN, rt_.stream());
+    }
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
 
     if (!options_.prefix_cache) {
@@ -1448,6 +1465,7 @@ class EngineGenerator final : public Generator {
   std::unique_ptr<Drafter> drafter_;
   std::unique_ptr<SpecLoop> spec_;
   std::unique_ptr<VisionEncoder> vision_;  // image input (RuntimeOptions::vision)
+  std::shared_ptr<const PlatosKeyGpu> platos_key_gpu_;  // optional --platos-key projection for /v1/embeddings
   DeviceBuffer chunk_tokens_, logits_, token_, taps_;
   DeviceBuffer masked_logits_, mask_dev_;
   std::vector<std::uint32_t> mask_host_;

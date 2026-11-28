@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -74,5 +75,27 @@ std::string dump(const Json& value);
 
 // Python truthiness of a JSON value.
 bool truthy(const Json& value);
+
+enum class EmbeddingEncodingFormat : std::uint8_t {
+  Float = 0,
+  Base64 = 1,
+};
+
+struct ParsedEmbeddingRequest {
+  model::EmbeddingRequest request;
+  EmbeddingEncodingFormat encoding_format = EmbeddingEncodingFormat::Float;
+};
+
+// Validates and tokenizes a POST /v1/embeddings request body (standard OpenAI + opt-in Atlas extensions).
+// Throws BadRequest (HTTP 400) on invalid input, encoding_format, pooling, normalize, tap_layer, or platos_key.
+ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
+                                               int num_tap_layers, bool has_platos_key);
+
+// Encodes contiguous little-endian IEEE-754 float32 values as RFC 4648 base64 (OpenAI encoding_format="base64").
+std::string encode_embedding_base64(std::span<const float> vec);
+
+// Formats exact OpenAI POST /v1/embeddings response JSON.
+Json embedding_response_json(const std::string& model_id, const model::EmbeddingResult& result,
+                             EmbeddingEncodingFormat format);
 
 }  // namespace ingine::serve

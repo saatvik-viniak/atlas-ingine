@@ -4,6 +4,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <span>
@@ -612,5 +613,149 @@ Json delta_json(const text::Delta& d) {
 }
 
 std::string dump(const Json& value) { return value.dump(-1, ' ', false, Json::error_handler_t::replace); }
+
+ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
+                                               int num_tap_layers, bool has_platos_key) {
+  ParsedEmbeddingRequest out;
+
+  if (const Json* m = get(body, "model")) {
+    if (!m->is_string()) throw BadRequest("'model' must be a string", "model");
+  }
+
+  const Json* inp = get(body, "input");
+  if (!inp) throw BadRequest("'input' is required", "input");
+
+  auto encode_one = [&](const std::string& text, const char* where_desc) {
+    if (text.empty()) {
+      throw BadRequest(std::string(where_desc) + " must not be empty", "input");
+    }
+    std::vector<int32_t> ids;
+    try {
+      ids = fmt.tokenizer().encode(text, /*special=*/false);
+    } catch (const std::invalid_argument& e) {
+      throw BadRequest(std::string("failed to tokenize 'input': ") + e.what(), "input");
+    }
+    if (ids.empty()) {
+      throw BadRequest(std::string(where_desc) + " tokenized to 0 tokens", "input");
+    }
+    if (static_cast<int>(ids.size()) > max_model_len) {
+      throw BadRequest("input has " + std::to_string(ids.size()) + " tokens; the model context is " +
+                           std::to_string(max_model_len),
+                       "input");
+    }
+    out.request.inputs.push_back(std::move(ids));
+  };
+
+  if (inp->is_string()) {
+    encode_one(inp->get_ref<const std::string&>(), "'input'");
+  } else if (inp->is_array()) {
+    if (inp->empty()) throw BadRequest("'input' array must not be empty", "input");
+    out.request.inputs.reserve(inp->size());
+    for (std::size_t i = 0; i < inp->size(); ++i) {
+      const Json& elem = (*inp)[i];
+      if (!elem.is_string()) {
+        throw BadRequest("'input[" + std::to_string(i) + "]' must be a string", "input");
+      }
+      encode_one(elem.get_ref<const std::string&>(), ("'input[" + std::to_string(i) + "]'").c_str());
+    }
+  } else {
+    throw BadRequest("'input' must be a string or a non-empty array of strings", "input");
+  }
+
+  if (const Json* ef = get(body, "encoding_format")) {
+    if (!ef->is_string()) throw BadRequest("'encoding_format' must be a string", "encoding_format");
+    const std::string& v = ef->get_ref<const std::string&>();
+    if (v == "float") {
+      out.encoding_format = EmbeddingEncodingFormat::Float;
+    } else if (v == "base64") {
+      out.encoding_format = EmbeddingEncodingFormat::Base64;
+    } else {
+      throw BadRequest("'encoding_format' must be 'float' or 'base64'", "encoding_format");
+    }
+  }
+
+  if (const Json* pool = get(body, "pooling")) {
+    if (!pool->is_string()) throw BadRequest("'pooling' must be a string", "pooling");
+    try {
+      out.request.pooling = model::parse_embedding_pooling(pool->get_ref<const std::string&>());
+    } catch (const std::invalid_argument& e) {
+      throw BadRequest(e.what(), "pooling");
+    }
+  }
+
+  if (const Json* norm = get(body, "normalize")) {
+    if (!norm->is_boolean()) throw BadRequest("'normalize' must be a boolean", "normalize");
+    out.request.normalize = norm->get<bool>();
+  }
+
+  if (const auto tap = num_int(body, "tap_layer")) {
+    if (num_tap_layers <= 0) {
+      throw BadRequest("'tap_layer' is not supported by this model backend", "tap_layer");
+    }
+    if (*tap < 0 || *tap >= num_tap_layers) {
+      throw BadRequest("'tap_layer' must be in [0, " + std::to_string(num_tap_layers - 1) + "]", "tap_layer");
+    }
+    out.request.tap_layer = static_cast<int>(*tap);
+  }
+
+  if (const Json* pk = get(body, "platos_key")) {
+    if (!pk->is_boolean()) throw BadRequest("'platos_key' must be a boolean", "platos_key");
+    out.request.use_platos_key = pk->get<bool>();
+    if (out.request.use_platos_key && !has_platos_key) {
+      throw BadRequest("'platos_key' requested but server was started without --platos-key", "platos_key");
+    }
+  }
+
+  return out;
+}
+
+std::string encode_embedding_base64(std::span<const float> vec) {
+  static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const std::size_t nbytes = vec.size() * sizeof(float);
+  std::vector<std::uint8_t> bytes(nbytes);
+  for (std::size_t i = 0; i < vec.size(); ++i) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &vec[i], sizeof(bits));
+    bytes[i * 4 + 0] = static_cast<std::uint8_t>(bits & 0xffu);
+    bytes[i * 4 + 1] = static_cast<std::uint8_t>((bits >> 8) & 0xffu);
+    bytes[i * 4 + 2] = static_cast<std::uint8_t>((bits >> 16) & 0xffu);
+    bytes[i * 4 + 3] = static_cast<std::uint8_t>((bits >> 24) & 0xffu);
+  }
+  std::string out;
+  out.reserve(((nbytes + 2) / 3) * 4);
+  for (std::size_t i = 0; i < nbytes; i += 3) {
+    const std::uint32_t b0 = bytes[i];
+    const std::uint32_t b1 = (i + 1 < nbytes) ? bytes[i + 1] : 0u;
+    const std::uint32_t b2 = (i + 2 < nbytes) ? bytes[i + 2] : 0u;
+    const std::uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
+    out.push_back(kAlphabet[(triple >> 18) & 0x3fu]);
+    out.push_back(kAlphabet[(triple >> 12) & 0x3fu]);
+    out.push_back(i + 1 < nbytes ? kAlphabet[(triple >> 6) & 0x3fu] : '=');
+    out.push_back(i + 2 < nbytes ? kAlphabet[triple & 0x3fu] : '=');
+  }
+  return out;
+}
+
+Json embedding_response_json(const std::string& model_id, const model::EmbeddingResult& result,
+                             EmbeddingEncodingFormat format) {
+  Json data = Json::array();
+  for (std::size_t i = 0; i < result.embeddings.size(); ++i) {
+    const auto& vec = result.embeddings[i];
+    Json emb;
+    if (format == EmbeddingEncodingFormat::Base64) {
+      emb = encode_embedding_base64(vec);
+    } else {
+      emb = Json::array();
+      for (float v : vec) emb.push_back(v);
+    }
+    data.push_back(Json{{"object", "embedding"}, {"index", static_cast<int>(i)}, {"embedding", std::move(emb)}});
+  }
+  return Json{{"object", "list"},
+              {"data", std::move(data)},
+              {"model", model_id},
+              {"usage",
+               {{"prompt_tokens", result.stats.total_prompt_tokens},
+                {"total_tokens", result.stats.total_prompt_tokens}}}};
+}
 
 }  // namespace ingine::serve

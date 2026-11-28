@@ -2,10 +2,13 @@
 #pragma once
 
 #include "ingine/generator.h"
+#include "ingine/platos_key.h"
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <variant>
@@ -39,6 +42,16 @@ class FakeGenerator final : public model::Generator {
     int yielded = 0;
     bool cancelled = false;
     bool done = false;
+  };
+
+  struct EmbeddingCall {
+    std::vector<std::vector<int32_t>> inputs;
+    model::EmbeddingPooling pooling = model::EmbeddingPooling::Mean;
+    bool normalize = true;
+    std::optional<int> tap_layer;
+    bool use_platos_key = false;
+    int kv_slots_allocated = 0;
+    bool lm_head_skipped = true;
   };
 
   explicit FakeGenerator(const text::Tokenizer& tokenizer, std::string model_id = "Inkling-2-Mini-fake",
@@ -80,6 +93,22 @@ class FakeGenerator final : public model::Generator {
   void set_supports_logit_masker(bool enabled) { supports_logit_masker_ = enabled; }
   void set_supports_images(bool enabled) { supports_images_ = enabled; }
 
+  bool supports_embeddings() const override { return supports_embeddings_; }
+  int embedding_dim() const override { return embedding_dim_; }
+  int num_tap_layers() const override { return num_tap_layers_; }
+  bool has_platos_key() const override { return platos_key_ != nullptr; }
+  int platos_key_out_dim() const override { return platos_key_ ? platos_key_->out_dim() : 0; }
+  std::string platos_key_tap_spec() const override { return platos_key_ ? platos_key_->metadata().tap_spec : ""; }
+  model::EmbeddingResult embed(const model::EmbeddingRequest& req) override;
+
+  void set_supports_embeddings(bool enabled) { supports_embeddings_ = enabled; }
+  void set_embedding_dim(int dim) { embedding_dim_ = dim; }
+  void set_num_tap_layers(int layers) { num_tap_layers_ = layers; }
+  void set_platos_key(std::shared_ptr<const PlatosKey> key);
+  void load_platos_key(const std::filesystem::path& safetensors_path,
+                       const std::filesystem::path& metadata_json_path = {});
+  std::vector<EmbeddingCall> embedding_calls() const;
+
   void set_prefill_stats_hook(PrefillStatsFn hook);
   std::string echo(std::span<const int32_t> prompt_ids) const;
   std::vector<Call> calls() const;
@@ -94,6 +123,10 @@ class FakeGenerator final : public model::Generator {
   model::LoopCdMode loopcd_mode_ = model::LoopCdMode::Off;
   bool supports_images_ = true;
   bool supports_logit_masker_ = true;
+  bool supports_embeddings_ = true;
+  int embedding_dim_ = 64;
+  int num_tap_layers_ = 48;
+  std::shared_ptr<const PlatosKey> platos_key_;
   Responder responder_;
   double token_delay_;
   model::KvCacheMode kv_cache_mode_ = model::KvCacheMode::PerPass;
@@ -103,6 +136,7 @@ class FakeGenerator final : public model::Generator {
   PrefillStatsFn prefill_stats_hook_;
   std::vector<Call> calls_;
   std::vector<Call> warm_start_calls_;
+  std::vector<EmbeddingCall> embedding_calls_;
   std::vector<int32_t> warmed_ids_;
   std::string warmed_namespace_;
   std::string warmed_persona_fp_;

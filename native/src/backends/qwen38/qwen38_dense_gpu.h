@@ -5,6 +5,7 @@
 #include "backends/qwen38/qwen38_gate3_metrics.h"
 #include "backends/qwen38/qwen38_manifest.h"
 #include "ingine/model_backend.h"
+#include "ingine/platos_key.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -28,6 +29,8 @@ struct Qwen38DenseLoadOptions {
   std::string revision = "482ca0f";
   int device_id = 0;
   std::optional<ingine::model::CheckpointPinSpec> expected_pins;
+  std::filesystem::path platos_key;
+  std::filesystem::path platos_key_metadata;
 };
 
 struct Qwen38DenseLoadStats {
@@ -122,6 +125,13 @@ class Qwen38DenseBackend final : public ingine::model::ModelBackend {
                                         const ingine::model::PrefillCallback& on_prefill = {}) override;
   ingine::model::GenerateStats warm_start(const ingine::model::Prompt& prompt,
                                           const ingine::model::Sampling& sampling) override;
+  bool supports_embeddings() const override { return true; }
+  int embedding_dim() const override { return config().hidden_size; }
+  int num_tap_layers() const override { return config().num_hidden_layers; }
+  bool has_platos_key() const override;
+  int platos_key_out_dim() const override;
+  std::string platos_key_tap_spec() const override;
+  ingine::model::EmbeddingResult embed(const ingine::model::EmbeddingRequest& req) override;
 
   // ingine::model::ModelBackend
   const ingine::model::BackendCapabilities& capabilities() const override { return profile_.capabilities; }
