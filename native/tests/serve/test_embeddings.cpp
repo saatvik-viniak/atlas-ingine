@@ -654,6 +654,86 @@ void test_cartridge_964_binding_and_layouts_fail_closed() {
       threw_mask_concat = true;
     }
     CHECK(threw_mask_concat);
+
+    // Rev5 regressions: reconcile ALL populated tap declarations within EACH source (tap_spec + target_tap).
+    // (a) Contradictory tap_spec=visit_41 and target_tap=visit_23 in the SAME sidecar -> fail-closed!
+    const auto m_sc_dup_conflict = tmp / "sc_dup_conflict.json";
+    {
+      std::ofstream mf(m_sc_dup_conflict);
+      mf << Json{{"cartridge_sha256", sha_a},
+                 {"donor_model_id", "thinkingmachines/Inkling-2-Mini"},
+                 {"d_donor", D_IN},
+                 {"d_target", D_OUT},
+                 {"tap_spec", "visit_41"},
+                 {"target_tap", "visit_23"}}
+                .dump();
+    }
+    bool threw_sc_dup = false;
+    try {
+      (void)make_served(1024, 8, p_a, m_sc_dup_conflict);
+    } catch (const std::invalid_argument&) {
+      threw_sc_dup = true;
+    }
+    CHECK(threw_sc_dup);
+
+    // (b) Contradictory tap_spec=visit_41 and target_tap=visit_23 in EMBEDDED metadata alone -> fail-closed!
+    const auto p_emb_dup_conflict = tmp / "key_emb_dup_conflict.safetensors";
+    write_safetensors(p_emb_dup_conflict, {{"R", "F32", {D_IN, D_OUT}, pack_f32(R)}},
+                      {{"format", "platos_key_v1"}, {"tap_spec", "visit_41"}, {"target_tap", "visit_23"}});
+    bool threw_emb_dup = false;
+    try {
+      (void)make_served(1024, 8, p_emb_dup_conflict, {});
+    } catch (const std::invalid_argument&) {
+      threw_emb_dup = true;
+    }
+    CHECK(threw_emb_dup);
+
+    // (c) Agreeing aliases tap_spec=layer_41 + target_tap=visit_41 in SAME sidecar -> succeeds at tap_layer=41!
+    const auto m_sc_dup_agree = tmp / "sc_dup_agree.json";
+    {
+      std::ofstream mf(m_sc_dup_agree);
+      mf << Json{{"cartridge_sha256", sha_a},
+                 {"donor_model_id", "thinkingmachines/Inkling-2-Mini"},
+                 {"d_donor", D_IN},
+                 {"d_target", D_OUT},
+                 {"tap_spec", "layer_41"},
+                 {"target_tap", "visit_41"}}
+                .dump();
+    }
+    auto s_sc_agree = make_served(1024, 8, p_a, m_sc_dup_agree);
+    const Response r_sca = http_req(s_sc_agree->port(), "POST", "/v1/embeddings",
+                                    Json{{"input", "hello"}, {"tap_layer", 41}, {"platos_key", true}}.dump());
+    CHECK(r_sca.status == 200);
+    const Response r_sca_bad = http_req(s_sc_agree->port(), "POST", "/v1/embeddings",
+                                        Json{{"input", "hello"}, {"tap_layer", 23}, {"platos_key", true}}.dump());
+    CHECK(r_sca_bad.status == 400);
+
+    // (d) Agreeing aliases tap_spec=layer_41 + target_tap=visit_41 in EMBEDDED metadata alone -> succeeds at 41!
+    const auto p_emb_dup_agree = tmp / "key_emb_dup_agree.safetensors";
+    write_safetensors(p_emb_dup_agree, {{"R", "F32", {D_IN, D_OUT}, pack_f32(R)}},
+                      {{"format", "platos_key_v1"}, {"tap_spec", "layer_41"}, {"target_tap", "visit_41"}});
+    auto s_emb_agree = make_served(1024, 8, p_emb_dup_agree, {});
+    const Response r_emba = http_req(s_emb_agree->port(), "POST", "/v1/embeddings",
+                                     Json{{"input", "hello"}, {"tap_layer", 41}, {"platos_key", true}}.dump());
+    CHECK(r_emba.status == 200);
+
+    // (e) Conflicting donor aliases within the same sidecar (donor_model_id vs donor_model) -> fail-closed!
+    const auto m_donor_dup_conflict = tmp / "sc_donor_dup_conflict.json";
+    {
+      std::ofstream mf(m_donor_dup_conflict);
+      mf << Json{{"cartridge_sha256", sha_a},
+                 {"donor_model_id", "thinkingmachines/Inkling-2-Mini"},
+                 {"donor_model", "Qwen/Qwen3.8-27B"},
+                 {"tap_spec", "visit_41"}}
+                .dump();
+    }
+    bool threw_donor_dup = false;
+    try {
+      (void)PlatosKey::load(p_a, m_donor_dup_conflict, D_IN);
+    } catch (const std::invalid_argument&) {
+      threw_donor_dup = true;
+    }
+    CHECK(threw_donor_dup);
   }
 
   // 4) Final-layer bound key (`tap_spec: "final_normed"`): accepts omitted tap_layer, rejects explicit tap_layer!

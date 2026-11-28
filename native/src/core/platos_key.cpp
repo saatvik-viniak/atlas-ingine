@@ -281,37 +281,73 @@ ParsedTapBinding parse_single_tap_source(std::string_view tap_spec, std::optiona
   return out;
 }
 
-// Reconciles independently validated embedded and sidecar tap bindings; rejects every contradiction fail-closed.
-void reconcile_tap_bindings(const ParsedTapBinding& emb, const ParsedTapBinding& sidecar, PlatosKeyMetadata& meta) {
-  const bool emb_declared = emb.has_spec || emb.tap_layer.has_value();
-  const bool sc_declared = sidecar.has_spec || sidecar.tap_layer.has_value();
+// Reconciles two independently validated tap bindings (within a single source or across sources);
+// rejects every contradiction fail-closed while preserving compatible aliases and omitted legacy fields.
+ParsedTapBinding merge_tap_bindings(const ParsedTapBinding& a, const ParsedTapBinding& b, const char* label_a,
+                                    const char* label_b) {
+  const bool a_decl = a.has_spec || a.tap_layer.has_value();
+  const bool b_decl = b.has_spec || b.tap_layer.has_value();
+  if (!a_decl) return b;
+  if (!b_decl) return a;
 
-  if (emb_declared && sc_declared) {
-    if (emb.is_multi_tap != sidecar.is_multi_tap) {
-      throw std::invalid_argument("platos_key: sidecar tap_spec '" + sidecar.raw_spec +
-                                  "' contradicts embedded tap_spec '" + emb.raw_spec + "' (multi-tap vs single-tap)");
-    }
-    if ((emb.requires_final_layer && sidecar.tap_layer.has_value()) ||
-        (sidecar.requires_final_layer && emb.tap_layer.has_value())) {
-      throw std::invalid_argument("platos_key: sidecar tap declaration ('" + sidecar.raw_spec +
-                                  "') contradicts embedded tap declaration ('" + emb.raw_spec +
-                                  "') (final-layer vs indexed tap)");
-    }
-    if (emb.tap_layer.has_value() && sidecar.tap_layer.has_value() && *emb.tap_layer != *sidecar.tap_layer) {
-      throw std::invalid_argument("platos_key: sidecar tap_layer=" + std::to_string(*sidecar.tap_layer) +
-                                  " (tap_spec='" + sidecar.raw_spec + "') contradicts embedded tap_layer=" +
-                                  std::to_string(*emb.tap_layer) + " (tap_spec='" + emb.raw_spec + "')");
-    }
+  if (a.is_multi_tap != b.is_multi_tap) {
+    throw std::invalid_argument(std::string("platos_key: ") + label_b + " tap_spec '" + b.raw_spec +
+                                "' contradicts " + label_a + " tap_spec '" + a.raw_spec +
+                                "' (multi-tap vs single-tap)");
+  }
+  if ((a.requires_final_layer && b.tap_layer.has_value()) ||
+      (b.requires_final_layer && a.tap_layer.has_value())) {
+    throw std::invalid_argument(std::string("platos_key: ") + label_b + " tap declaration ('" + b.raw_spec +
+                                "') contradicts " + label_a + " tap declaration ('" + a.raw_spec +
+                                "') (final-layer vs indexed tap)");
+  }
+  if (a.tap_layer.has_value() && b.tap_layer.has_value() && *a.tap_layer != *b.tap_layer) {
+    throw std::invalid_argument(std::string("platos_key: ") + label_b + " tap_layer=" + std::to_string(*b.tap_layer) +
+                                " (tap_spec='" + b.raw_spec + "') contradicts " + label_a + " tap_layer=" +
+                                std::to_string(*a.tap_layer) + " (tap_spec='" + a.raw_spec + "')");
   }
 
-  meta.is_multi_tap = emb.is_multi_tap || sidecar.is_multi_tap;
-  meta.requires_final_layer = emb.requires_final_layer || sidecar.requires_final_layer;
-  meta.expected_tap_layer = sidecar.tap_layer.has_value() ? sidecar.tap_layer : emb.tap_layer;
-  if (!sidecar.raw_spec.empty() && !(sidecar.is_generic_single_tap && !emb.raw_spec.empty())) {
-    meta.tap_spec = sidecar.raw_spec;
+  ParsedTapBinding merged;
+  merged.has_spec = a.has_spec || b.has_spec;
+  merged.is_multi_tap = a.is_multi_tap || b.is_multi_tap;
+  merged.requires_final_layer = a.requires_final_layer || b.requires_final_layer;
+  merged.tap_layer = b.tap_layer.has_value() ? b.tap_layer : a.tap_layer;
+  merged.is_generic_single_tap = a.is_generic_single_tap && b.is_generic_single_tap;
+  if (!b.raw_spec.empty() && !(b.is_generic_single_tap && !a.raw_spec.empty())) {
+    merged.raw_spec = b.raw_spec;
   } else {
-    meta.tap_spec = emb.raw_spec;
+    merged.raw_spec = a.raw_spec;
   }
+  return merged;
+}
+
+// Reconciles all populated tap_spec/target_tap entries + optional explicit tap_layer within one source.
+ParsedTapBinding parse_and_reconcile_source_taps(const std::vector<std::pair<std::string, std::string>>& spec_entries,
+                                                 std::optional<int> explicit_tap_layer, const char* source_label) {
+  if (spec_entries.empty()) {
+    return parse_single_tap_source("", explicit_tap_layer, source_label);
+  }
+  ParsedTapBinding acc;
+  std::string acc_label;
+  for (const auto& [key_name, spec_val] : spec_entries) {
+    const std::string entry_label = std::string(source_label) + " '" + key_name + "'";
+    const ParsedTapBinding cur = parse_single_tap_source(spec_val, explicit_tap_layer, entry_label.c_str());
+    if (acc_label.empty()) {
+      acc = cur;
+      acc_label = entry_label;
+    } else {
+      acc = merge_tap_bindings(acc, cur, acc_label.c_str(), entry_label.c_str());
+    }
+  }
+  return acc;
+}
+
+void reconcile_tap_bindings(const ParsedTapBinding& emb, const ParsedTapBinding& sidecar, PlatosKeyMetadata& meta) {
+  const ParsedTapBinding final_tap = merge_tap_bindings(emb, sidecar, "embedded", "sidecar");
+  meta.is_multi_tap = final_tap.is_multi_tap;
+  meta.requires_final_layer = final_tap.requires_final_layer;
+  meta.expected_tap_layer = final_tap.tap_layer;
+  meta.tap_spec = final_tap.raw_spec;
 }
 
 // Canonicalizes an explicit checkpoint identifier via documented packaging/runtime aliases only.
@@ -346,14 +382,39 @@ std::string canonical_checkpoint_id(std::string_view name) {
   return out;
 }
 
-struct SidecarTapFields {
-  std::string tap_spec;
+std::string reconcile_donor_aliases(const std::vector<std::pair<std::string, std::string>>& entries,
+                                    const char* source_label) {
+  std::string chosen;
+  std::string chosen_ckpt;
+  std::string chosen_key;
+  for (const auto& [k, val] : entries) {
+    if (val.empty()) continue;
+    const std::string ckpt = canonical_checkpoint_id(val);
+    if (ckpt.empty()) {
+      throw std::invalid_argument(std::string("platos_key: malformed ") + source_label + " '" + k + "'='" + val + "'");
+    }
+    if (chosen.empty()) {
+      chosen = val;
+      chosen_ckpt = ckpt;
+      chosen_key = k;
+    } else if (ckpt != chosen_ckpt) {
+      throw std::invalid_argument(std::string("platos_key: ") + source_label + " '" + k + "'='" + val +
+                                  "' contradicts '" + chosen_key + "'='" + chosen + "'");
+    }
+  }
+  return chosen;
+}
+
+struct SidecarDeclaredFields {
+  std::vector<std::pair<std::string, std::string>> tap_specs;
   std::optional<int> tap_layer;
+  std::vector<std::pair<std::string, std::string>> donor_models;
+  std::string cartridge_id;
 };
 
-SidecarTapFields merge_and_validate_json_metadata(std::string_view json_text, PlatosKeyMetadata& meta) {
-  SidecarTapFields sc_tap;
-  if (json_text.empty()) return sc_tap;
+SidecarDeclaredFields merge_and_validate_json_metadata(std::string_view json_text, PlatosKeyMetadata& meta) {
+  SidecarDeclaredFields sc_fields;
+  if (json_text.empty()) return sc_fields;
 
   nlohmann::ordered_json obj;
   try {
@@ -406,15 +467,31 @@ SidecarTapFields merge_and_validate_json_metadata(std::string_view json_text, Pl
   }
 
   if (auto it = obj.find("tap_layer"); it != obj.end() && !it->is_null()) {
-    sc_tap.tap_layer = parse_json_int(*it, "tap_layer");
+    sc_fields.tap_layer = parse_json_int(*it, "tap_layer");
   }
   for (const char* tkey : {"tap_spec", "target_tap"}) {
     if (auto it = obj.find(tkey); it != obj.end() && !it->is_null()) {
       if (!it->is_string()) {
         throw std::invalid_argument(std::string("platos_key: metadata JSON '") + tkey + "' must be a string");
       }
-      if (sc_tap.tap_spec.empty()) sc_tap.tap_spec = it->get<std::string>();
+      const std::string val = it->get<std::string>();
+      if (!val.empty()) sc_fields.tap_specs.emplace_back(tkey, val);
     }
+  }
+  for (const char* dkey : {"donor_model_id", "donor_model", "source_model", "model_id"}) {
+    if (auto it = obj.find(dkey); it != obj.end() && !it->is_null()) {
+      if (!it->is_string()) {
+        throw std::invalid_argument(std::string("platos_key: metadata JSON '") + dkey + "' must be a string");
+      }
+      const std::string val = it->get<std::string>();
+      if (!val.empty()) sc_fields.donor_models.emplace_back(dkey, val);
+    }
+  }
+  if (auto it = obj.find("cartridge_id"); it != obj.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      throw std::invalid_argument("platos_key: metadata JSON 'cartridge_id' must be a string");
+    }
+    sc_fields.cartridge_id = it->get<std::string>();
   }
   if (auto it = obj.find("forbidden_coord_d2027_zero_masked"); it != obj.end() && !it->is_null()) {
     if (!it->is_boolean()) {
@@ -430,7 +507,7 @@ SidecarTapFields merge_and_validate_json_metadata(std::string_view json_text, Pl
       meta.raw_metadata[k] = v.dump();
     }
   }
-  return sc_tap;
+  return sc_fields;
 }
 
 }  // namespace
@@ -626,8 +703,13 @@ std::shared_ptr<const PlatosKey> PlatosKey::load_with_json(const std::filesystem
     key->meta_.scale = decode_tensor_f32(buf, *sc)[0];
   }
 
-  // Extract and independently validate embedded safetensors tap fields BEFORE sidecar merge.
-  const std::string emb_tap_spec = meta_get_first(buf.metadata, {"tap_spec", "target_tap"});
+  // Extract and reconcile ALL populated embedded safetensors tap & donor declarations BEFORE sidecar merge.
+  std::vector<std::pair<std::string, std::string>> emb_tap_specs;
+  for (const char* tkey : {"tap_spec", "target_tap"}) {
+    if (auto it = buf.metadata.find(tkey); it != buf.metadata.end() && !it->second.empty()) {
+      emb_tap_specs.emplace_back(tkey, it->second);
+    }
+  }
   std::optional<int> emb_tap_layer;
   if (const std::string raw_emb_tl = meta_get_first(buf.metadata, {"tap_layer"});
       !raw_emb_tl.empty() && to_lower_ascii(raw_emb_tl) != "none" && to_lower_ascii(raw_emb_tl) != "null") {
@@ -636,28 +718,42 @@ std::shared_ptr<const PlatosKey> PlatosKey::load_with_json(const std::filesystem
       throw std::invalid_argument("platos_key: malformed embedded metadata tap_layer '" + raw_emb_tl + "'");
     }
   }
-  const ParsedTapBinding emb_tap = parse_single_tap_source(emb_tap_spec, emb_tap_layer, "embedded");
+  const ParsedTapBinding emb_tap = parse_and_reconcile_source_taps(emb_tap_specs, emb_tap_layer, "embedded");
 
-  // Validate sidecar JSON fields (including SHA-256) and independently parse sidecar tap fields.
-  const SidecarTapFields sc_fields = merge_and_validate_json_metadata(metadata_json, key->meta_);
-  const ParsedTapBinding sc_tap = parse_single_tap_source(sc_fields.tap_spec, sc_fields.tap_layer, "sidecar");
+  std::vector<std::pair<std::string, std::string>> emb_donors;
+  for (const char* dkey : {"donor_model_id", "donor_model", "source_model", "model_id"}) {
+    if (auto it = buf.metadata.find(dkey); it != buf.metadata.end() && !it->second.empty()) {
+      emb_donors.emplace_back(dkey, it->second);
+    }
+  }
+  const std::string emb_donor = reconcile_donor_aliases(emb_donors, "embedded");
+  const std::string emb_cartridge_id = meta_get_first(buf.metadata, {"cartridge_id"});
+
+  // Validate sidecar JSON fields (including SHA-256) and reconcile ALL populated sidecar tap & donor declarations.
+  const SidecarDeclaredFields sc_fields = merge_and_validate_json_metadata(metadata_json, key->meta_);
+  const ParsedTapBinding sc_tap =
+      parse_and_reconcile_source_taps(sc_fields.tap_specs, sc_fields.tap_layer, "sidecar");
+  const std::string sc_donor = reconcile_donor_aliases(sc_fields.donor_models, "sidecar");
 
   key->meta_.format = meta_get_first(key->meta_.raw_metadata, {"format"});
   if (key->meta_.format.empty()) key->meta_.format = detected_format;
   key->meta_.schema_version = meta_get_first(key->meta_.raw_metadata, {"schema_version"});
-  key->meta_.cartridge_id = meta_get_first(key->meta_.raw_metadata, {"cartridge_id"});
-  key->meta_.donor_model =
-      meta_get_first(key->meta_.raw_metadata, {"donor_model_id", "donor_model", "source_model", "model_id"});
-  // If both embedded safetensors metadata and sidecar JSON declare a donor checkpoint, require agreement.
-  const std::string emb_donor = meta_get_first(buf.metadata, {"donor_model_id", "donor_model", "source_model", "model_id"});
-  if (!emb_donor.empty() && !key->meta_.donor_model.empty()) {
+  if (!emb_cartridge_id.empty() && !sc_fields.cartridge_id.empty() && emb_cartridge_id != sc_fields.cartridge_id) {
+    throw std::invalid_argument("platos_key: sidecar cartridge_id '" + sc_fields.cartridge_id +
+                                "' contradicts embedded cartridge_id '" + emb_cartridge_id + "'");
+  }
+  key->meta_.cartridge_id = !sc_fields.cartridge_id.empty() ? sc_fields.cartridge_id : emb_cartridge_id;
+
+  // Cross-source donor reconciliation: if both embedded and sidecar declare a donor checkpoint, require agreement.
+  if (!emb_donor.empty() && !sc_donor.empty()) {
     const std::string emb_ckpt = canonical_checkpoint_id(emb_donor);
-    const std::string merged_ckpt = canonical_checkpoint_id(key->meta_.donor_model);
-    if (emb_ckpt != merged_ckpt) {
-      throw std::invalid_argument("platos_key: sidecar donor_model_id '" + key->meta_.donor_model +
+    const std::string sc_ckpt = canonical_checkpoint_id(sc_donor);
+    if (emb_ckpt != sc_ckpt) {
+      throw std::invalid_argument("platos_key: sidecar donor_model_id '" + sc_donor +
                                   "' contradicts embedded donor_model '" + emb_donor + "'");
     }
   }
+  key->meta_.donor_model = !sc_donor.empty() ? sc_donor : emb_donor;
   key->meta_.target_model = meta_get_first(key->meta_.raw_metadata, {"target_model"});
   key->meta_.method = meta_get_first(key->meta_.raw_metadata, {"method", "solver"});
 
