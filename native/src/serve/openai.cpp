@@ -660,6 +660,73 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
   if (!inp) throw BadRequest("'input' is required", "input");
 
   const bool wrap_bos_eos = (fmt.kind() == text::ChatFormatKind::EmbeddingGemma2);
+
+  // Extracts an exact integer from JSON `v` without silent narrowing or saturation.
+  // Rejects booleans, non-numbers, non-integral/non-finite floats, and values outside [min_val, max_val].
+  auto parse_json_int_in_range = [](const Json& v, int min_val, int max_val, const char* param,
+                                    const std::string& field_desc) -> int {
+    if (v.is_boolean() || !v.is_number()) {
+      throw BadRequest(field_desc + " must be an integer", param);
+    }
+    if (v.is_number_unsigned()) {
+      const std::uint64_t u = v.get<std::uint64_t>();
+      if (max_val < 0 || u > static_cast<std::uint64_t>(max_val) ||
+          (min_val > 0 && u < static_cast<std::uint64_t>(min_val))) {
+        throw BadRequest(field_desc + " value " + std::to_string(u) + " is outside valid integer range [" +
+                             std::to_string(min_val) + ", " + std::to_string(max_val) + "]",
+                         param);
+      }
+      return static_cast<int>(u);
+    }
+    if (v.is_number_integer()) {
+      const std::int64_t s = v.get<std::int64_t>();
+      if (s < static_cast<std::int64_t>(min_val) || s > static_cast<std::int64_t>(max_val)) {
+        throw BadRequest(field_desc + " value " + std::to_string(s) + " is outside valid integer range [" +
+                             std::to_string(min_val) + ", " + std::to_string(max_val) + "]",
+                         param);
+      }
+      return static_cast<int>(s);
+    }
+    const double d = v.get<double>();
+    if (!std::isfinite(d) || std::trunc(d) != d) {
+      throw BadRequest(field_desc + " must be an integer", param);
+    }
+    if (d < static_cast<double>(min_val) || d > static_cast<double>(max_val)) {
+      throw BadRequest(field_desc + " value is outside valid integer range [" + std::to_string(min_val) + ", " +
+                           std::to_string(max_val) + "]",
+                       param);
+    }
+    return static_cast<int>(static_cast<std::int64_t>(d));
+  };
+
+  auto parse_max_soft_tokens = [](const Json& mst, const std::string& where_desc) -> int {
+    if (mst.is_boolean() || !mst.is_number_integer()) {
+      throw BadRequest(where_desc + " 'max_soft_tokens' must be an integer", "input");
+    }
+    int val = 0;
+    if (mst.is_number_unsigned()) {
+      const std::uint64_t u = mst.get<std::uint64_t>();
+      if (u > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+        throw BadRequest(where_desc + " 'max_soft_tokens' value " + std::to_string(u) +
+                             " exceeds valid integer range",
+                         "input");
+      }
+      val = static_cast<int>(u);
+    } else {
+      const std::int64_t s = mst.get<std::int64_t>();
+      if (s < 0 || s > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
+        throw BadRequest(where_desc + " 'max_soft_tokens' value " + std::to_string(s) +
+                             " is outside valid integer range",
+                         "input");
+      }
+      val = static_cast<int>(s);
+    }
+    if (val != 70 && val != 140 && val != 280 && val != 560 && val != 1120) {
+      throw BadRequest("'max_soft_tokens' must be one of [70, 140, 280, 560, 1120]", "input");
+    }
+    return val;
+  };
+
   auto eg2_num_soft_tokens = [](int h, int w, int max_st) -> int {
     if (max_st != 70 && max_st != 140 && max_st != 280 && max_st != 560 && max_st != 1120) {
       throw BadRequest("'max_soft_tokens' must be one of [70, 140, 280, 560, 1120]", "input");
@@ -685,22 +752,17 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
     return (th / side_mult) * (tw / side_mult);
   };
 
-  auto extract_uri_and_budget = [](const Json& obj, int default_budget, const char* where_desc) -> std::pair<std::string, int> {
+  auto extract_uri_and_budget = [&](const Json& obj, int default_budget,
+                                    const char* where_desc) -> std::pair<std::string, int> {
     int budget = default_budget;
     if (const Json* mst = get(obj, "max_soft_tokens")) {
-      if (!mst->is_number_integer() || mst->is_boolean()) {
-        throw BadRequest(std::string(where_desc) + " 'max_soft_tokens' must be an integer", "input");
-      }
-      budget = mst->get<int>();
+      budget = parse_max_soft_tokens(*mst, where_desc);
     }
     if (const Json* iu = get(obj, "image_url")) {
       if (iu->is_string()) return {iu->get<std::string>(), budget};
       if (iu->is_object()) {
         if (const Json* mst2 = get(*iu, "max_soft_tokens")) {
-          if (!mst2->is_number_integer() || mst2->is_boolean()) {
-            throw BadRequest(std::string(where_desc) + " 'max_soft_tokens' must be an integer", "input");
-          }
-          budget = mst2->get<int>();
+          budget = parse_max_soft_tokens(*mst2, where_desc);
         }
         if (const Json* u = get(*iu, "url"); u && u->is_string()) return {u->get<std::string>(), budget};
       }
@@ -713,8 +775,36 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
 
   bool any_images = false;
   bool any_audios = false;
+  std::int64_t total_images = 0;
+  std::int64_t total_image_tokens = 0;
   std::vector<std::vector<model::EmbeddingImage>> per_item_images;
   std::vector<std::vector<model::EmbeddingAudio>> per_item_audios;
+
+  auto reserve_image_slots = [&](std::size_t add_count) {
+    if (opts.max_images < 0) {
+      total_images += static_cast<std::int64_t>(add_count);
+      return;
+    }
+    const std::uint64_t max_u = static_cast<std::uint64_t>(opts.max_images);
+    const std::uint64_t cur_u = static_cast<std::uint64_t>(total_images);
+    if (add_count > max_u || cur_u > max_u - add_count) {
+      const std::uint64_t attempted =
+          (add_count <= std::numeric_limits<std::uint64_t>::max() - cur_u) ? (cur_u + add_count) : max_u + 1;
+      throw BadRequest("the request has " + std::to_string(attempted) + " images/video frames; at most " +
+                           std::to_string(opts.max_images) + " are accepted",
+                       "input");
+    }
+    total_images += static_cast<std::int64_t>(add_count);
+  };
+
+  auto add_image_tokens = [&](int n_soft) {
+    total_image_tokens += static_cast<std::int64_t>(n_soft);
+    if (opts.max_total_tokens >= 0 && total_image_tokens > static_cast<std::int64_t>(opts.max_total_tokens)) {
+      throw BadRequest("the images/video frames of the request take " + std::to_string(total_image_tokens) +
+                           " tokens; at most " + std::to_string(opts.max_total_tokens) + " are accepted",
+                       "input");
+    }
+  };
 
   auto encode_text_item = [&](const std::string& text, const char* where_desc) {
     if (text.empty()) {
@@ -795,6 +885,7 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
           throw BadRequest("multimodal image embeddings are only supported on multimodal encoder models", "input");
         }
         const auto [uri, budget] = extract_uri_and_budget(part, opts.vision_soft_tokens_per_image, where_desc);
+        reserve_image_slots(1);
         image::Image decoded;
         try {
           decoded = image::decode_raw_rgb_data_uri(uri, opts.image_limits);
@@ -802,6 +893,7 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
           throw BadRequest(e.what(), "input");
         }
         const int n_soft = eg2_num_soft_tokens(decoded.height, decoded.width, budget);
+        add_image_tokens(n_soft);
         ids.push_back(kBoi);
         ids.insert(ids.end(), static_cast<std::size_t>(n_soft), kImgTok);
         ids.push_back(kEoi);
@@ -828,11 +920,9 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
         }
         int frame_budget = opts.video_soft_tokens_per_frame;
         if (const Json* mst = get(part, "max_soft_tokens")) {
-          if (!mst->is_number_integer() || mst->is_boolean()) {
-            throw BadRequest("'max_soft_tokens' must be an integer", "input");
-          }
-          frame_budget = mst->get<int>();
+          frame_budget = parse_max_soft_tokens(*mst, where_desc);
         }
+        reserve_image_slots(frames->size());
         for (std::size_t fi = 0; fi < frames->size(); ++fi) {
           const Json& fr = (*frames)[fi];
           std::string uri;
@@ -851,6 +941,7 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
             throw BadRequest(e.what(), "input");
           }
           const int n_soft = eg2_num_soft_tokens(decoded.height, decoded.width, fbudget);
+          add_image_tokens(n_soft);
           ids.push_back(kBoi);
           ids.insert(ids.end(), static_cast<std::size_t>(n_soft), kVidTok);
           ids.push_back(kEoi);
@@ -1003,14 +1094,11 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
     out.request.normalize = norm->get<bool>();
   }
 
-  if (const auto tap = num_int(body, "tap_layer")) {
+  if (const Json* tv = get(body, "tap_layer")) {
     if (opts.num_tap_layers <= 0) {
       throw BadRequest("'tap_layer' is not supported by this model backend", "tap_layer");
     }
-    if (*tap < 0 || *tap >= opts.num_tap_layers) {
-      throw BadRequest("'tap_layer' must be in [0, " + std::to_string(opts.num_tap_layers - 1) + "]", "tap_layer");
-    }
-    out.request.tap_layer = static_cast<int>(*tap);
+    out.request.tap_layer = parse_json_int_in_range(*tv, 0, opts.num_tap_layers - 1, "tap_layer", "'tap_layer'");
   }
 
   if (const Json* cid = get(body, "cartridge_id")) {
@@ -1041,6 +1129,11 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
                      out.request.cartridge_sha256.has_value() ? "cartridge_sha256" : "cartridge_id");
   }
 
+  const int active_embed_dim =
+      out.request.tap_layer.has_value()
+          ? (opts.tap_embedding_dim > 0 ? opts.tap_embedding_dim : opts.embedding_dim)
+          : opts.embedding_dim;
+
   if (out.request.use_platos_key && opts.loaded_platos_key != nullptr) {
     try {
       opts.loaded_platos_key->validate_request_tap(out.request.tap_layer);
@@ -1055,29 +1148,38 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
       const char* param = (msg.find("cartridge_id") != std::string_view::npos) ? "cartridge_id" : "cartridge_sha256";
       throw BadRequest(e.what(), param);
     }
+    if (active_embed_dim > 0 && opts.loaded_platos_key->in_dim() != active_embed_dim) {
+      throw BadRequest("platos_key d_in (" + std::to_string(opts.loaded_platos_key->in_dim()) +
+                           ") does not match active " +
+                           (out.request.tap_layer.has_value() ? "tap_layer" : "final") + " embedding dim (" +
+                           std::to_string(active_embed_dim) + ")",
+                       "tap_layer");
+    }
   }
 
-  if (const auto dims = num_int(body, "dimensions")) {
-    if (*dims <= 0) {
-      throw BadRequest("'dimensions' must be a positive integer", "dimensions");
-    }
+  if (const Json* dv = get(body, "dimensions")) {
+    const int d = parse_json_int_in_range(*dv, 1, std::numeric_limits<int>::max(), "dimensions", "'dimensions'");
     if (out.request.use_platos_key) {
       throw BadRequest("'dimensions' cannot be combined with 'platos_key'", "dimensions");
     }
-    const int d = static_cast<int>(*dims);
     if (!opts.matryoshka_dims.empty()) {
-      if (!out.request.tap_layer.has_value() &&
-          std::find(opts.matryoshka_dims.begin(), opts.matryoshka_dims.end(), d) == opts.matryoshka_dims.end()) {
-        std::string allowed;
-        for (std::size_t i = 0; i < opts.matryoshka_dims.size(); ++i) {
-          if (i) allowed += ", ";
-          allowed += std::to_string(opts.matryoshka_dims[i]);
+      if (!out.request.tap_layer.has_value()) {
+        if (std::find(opts.matryoshka_dims.begin(), opts.matryoshka_dims.end(), d) == opts.matryoshka_dims.end()) {
+          std::string allowed;
+          for (std::size_t i = 0; i < opts.matryoshka_dims.size(); ++i) {
+            if (i) allowed += ", ";
+            allowed += std::to_string(opts.matryoshka_dims[i]);
+          }
+          throw BadRequest("'dimensions' must be one of [" + allowed + "]", "dimensions");
         }
-        throw BadRequest("'dimensions' must be one of [" + allowed + "]", "dimensions");
+      } else if (active_embed_dim > 0 && d > active_embed_dim) {
+        throw BadRequest("'dimensions' (" + std::to_string(d) + ") exceeds tap embedding dim (" +
+                             std::to_string(active_embed_dim) + ")",
+                         "dimensions");
       }
-    } else if (opts.embedding_dim > 0 && d != opts.embedding_dim) {
+    } else if (active_embed_dim > 0 && d != active_embed_dim) {
       throw BadRequest("'dimensions' truncation is not supported by this model (native dim is " +
-                           std::to_string(opts.embedding_dim) + ")",
+                           std::to_string(active_embed_dim) + ")",
                        "dimensions");
     }
     out.request.dimensions = d;

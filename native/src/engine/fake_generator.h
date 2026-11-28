@@ -101,6 +101,7 @@ class FakeGenerator final : public model::Generator {
 
   bool supports_embeddings() const override { return supports_embeddings_; }
   int embedding_dim() const override { return embedding_dim_; }
+  int tap_embedding_dim() const override { return tap_embedding_dim_ > 0 ? tap_embedding_dim_ : embedding_dim_; }
   int num_tap_layers() const override { return num_tap_layers_; }
   std::vector<int> matryoshka_dims() const override { return matryoshka_dims_; }
   std::map<std::string, std::string> embedding_prompt_prefixes() const override { return embedding_prompt_prefixes_; }
@@ -112,6 +113,7 @@ class FakeGenerator final : public model::Generator {
 
   void set_supports_embeddings(bool enabled) { supports_embeddings_ = enabled; }
   void set_embedding_dim(int dim) { embedding_dim_ = dim; }
+  void set_tap_embedding_dim(int dim) { tap_embedding_dim_ = dim; }
   void set_num_tap_layers(int layers) { num_tap_layers_ = layers; }
   void set_matryoshka_dims(std::vector<int> dims) { matryoshka_dims_ = std::move(dims); }
   void set_embedding_prompt_prefixes(std::map<std::string, std::string> prefixes) {
@@ -140,6 +142,7 @@ class FakeGenerator final : public model::Generator {
   bool supports_logit_masker_ = true;
   bool supports_embeddings_ = true;
   int embedding_dim_ = 64;
+  int tap_embedding_dim_ = 0;
   int num_tap_layers_ = 48;
   std::vector<int> matryoshka_dims_;
   std::map<std::string, std::string> embedding_prompt_prefixes_;

@@ -392,7 +392,7 @@ std::vector<FakeGenerator::Call> FakeGenerator::warm_start_calls() const {
 
 void FakeGenerator::set_platos_key(std::shared_ptr<const PlatosKey> key) {
   if (key) {
-    key->validate_binding(model_id_, model_family_, embedding_dim_, num_tap_layers_);
+    key->validate_binding(model_id_, model_family_, embedding_dim_, num_tap_layers_, tap_embedding_dim());
   }
   std::lock_guard lock(mutex_);
   platos_key_ = std::move(key);
@@ -400,7 +400,8 @@ void FakeGenerator::set_platos_key(std::shared_ptr<const PlatosKey> key) {
 
 void FakeGenerator::load_platos_key(const std::filesystem::path& safetensors_path,
                                     const std::filesystem::path& metadata_json_path) {
-  auto key = PlatosKey::load(safetensors_path, metadata_json_path, embedding_dim_);
+  const int expected = (tap_embedding_dim() == embedding_dim_) ? embedding_dim_ : 0;
+  auto key = PlatosKey::load(safetensors_path, metadata_json_path, expected);
   set_platos_key(std::move(key));
 }
 
@@ -435,7 +436,11 @@ model::EmbeddingResult FakeGenerator::embed(const model::EmbeddingRequest& req) 
 
   const auto t0 = std::chrono::steady_clock::now();
   const int B = static_cast<int>(req.inputs.size());
-  const int H = embedding_dim_;
+  const int H = req.tap_layer.has_value() ? tap_embedding_dim() : embedding_dim_;
+  if (req.use_platos_key && pk->in_dim() != H) {
+    throw std::invalid_argument("embed: platos_key d_in (" + std::to_string(pk->in_dim()) +
+                                ") does not match embedding input dim (" + std::to_string(H) + ")");
+  }
   const int effective_tap = req.tap_layer.value_or(-1);
   // Deterministic causal per-token synthetic hidden state H(seq, pos, layer, dim):
   // strictly causal (depends only on tokens 0..pos) and sensitive to tap_layer so tests verify pooling + early exit.

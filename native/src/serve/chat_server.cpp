@@ -185,6 +185,7 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
       is_encoder_only_(generator.is_encoder_only()),
       supports_embeddings_(generator.supports_embeddings()),
       embedding_dim_(generator.embedding_dim()),
+      tap_embedding_dim_(generator.tap_embedding_dim()),
       num_tap_layers_(generator.num_tap_layers()),
       matryoshka_dims_(generator.matryoshka_dims()),
       embedding_prompt_prefixes_(generator.embedding_prompt_prefixes()),
@@ -203,7 +204,7 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
       created_(std::time(nullptr)),
       scheduler_(generator, fmt.stop_ids(), options.max_queue) {
   if (platos_key_) {
-    platos_key_->validate_binding(model_id_, model_family_, embedding_dim_, num_tap_layers_);
+    platos_key_->validate_binding(model_id_, model_family_, embedding_dim_, num_tap_layers_, tap_embedding_dim_);
   }
   if (!options.warm_start_prompt.empty()) {
     if (!cache_namespace_header_.empty() && options.warm_start_namespace.empty()) {
@@ -430,12 +431,15 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
       EmbeddingParseOptions popts;
       popts.max_model_len = max_model_len_;
       popts.embedding_dim = embedding_dim_;
+      popts.tap_embedding_dim = tap_embedding_dim_;
       popts.num_tap_layers = num_tap_layers_;
       popts.has_platos_key = has_platos_key_;
       popts.loaded_platos_key = platos_key_.get();
       popts.supports_images = image_options_.enabled;
       popts.supports_audio = supports_audio_;
       popts.image_limits = image_options_.limits;
+      popts.max_images = image_options_.max_images;
+      popts.max_total_tokens = image_options_.max_total_tokens;
       popts.matryoshka_dims = matryoshka_dims_;
       popts.prompt_prefixes = embedding_prompt_prefixes_;
       emb_req = parse_embedding_request(body, fmt_, popts);

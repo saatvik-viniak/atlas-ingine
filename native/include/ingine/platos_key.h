@@ -88,8 +88,11 @@ class PlatosKey {
   void project_cpu(const float* in_x, int batch, float* out_y, bool l2_normalize = false) const;
 
   // Fail-closed runtime binding checks (startup donor/dim/tap-range/layout check + per-request tap/cartridge checks).
+  // `active_tap_embedding_dim`: intermediate tap hidden width when distinct from final `active_embedding_dim`
+  // (e.g. EmbeddingGemma 2: hidden_size=512 at tap layers vs embedding_dim=768 at final). 0 => same as active_embedding_dim.
   void validate_binding(std::string_view active_model_id, std::string_view active_model_family,
-                        int active_embedding_dim, int active_num_tap_layers) const;
+                        int active_embedding_dim, int active_num_tap_layers,
+                        int active_tap_embedding_dim = 0) const;
   void validate_request_tap(std::optional<int> requested_tap_layer) const;
   void validate_request_identity(std::string_view requested_cartridge_id,
                                  std::string_view requested_cartridge_sha256) const;
@@ -111,6 +114,16 @@ class PlatosKey {
 void l2_normalize_rows_cpu(float* data, int batch, int dim) noexcept;
 
 #if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
+// Device weight & GEMM input precision for GPU-resident Plato's Key projection.
+//   Fp16: default for Inkling/Qwen (IEEE FP16 weights + FP16 cuBLASLt inputs on batch>8, FP32 accumulation).
+//   Bf16: sm_80+ EmbeddingGemma 2 (BF16 weights + BF16 cuBLASLt inputs on batch>8, FP32 accumulation, zero FP16).
+//   Fp32: sm_70 V100 EmbeddingGemma 2 & exact FP32 paths (FP32 weights + FP32 cuBLASLt on batch>8, zero FP16).
+enum class PlatosKeyPrecision : std::uint8_t {
+  Fp16 = 0,
+  Bf16 = 1,
+  Fp32 = 2,
+};
+
 // Immutable GPU-resident Plato's Key projector. `cuda_stream` is a `cudaStream_t` passed as `void*`
 // so this public header remains CUDA-header-free.
 class PlatosKeyGpu {
@@ -120,15 +133,19 @@ class PlatosKeyGpu {
   PlatosKeyGpu& operator=(const PlatosKeyGpu&) = delete;
 
   static std::shared_ptr<const PlatosKeyGpu> create(std::shared_ptr<const PlatosKey> key,
-                                                    void* cuda_stream = nullptr);
+                                                    void* cuda_stream = nullptr,
+                                                    PlatosKeyPrecision precision = PlatosKeyPrecision::Fp16);
   static std::shared_ptr<const PlatosKeyGpu> load(const std::filesystem::path& safetensors_path,
-                                                  int expected_in_dim = 0, void* cuda_stream = nullptr);
+                                                  int expected_in_dim = 0, void* cuda_stream = nullptr,
+                                                  PlatosKeyPrecision precision = PlatosKeyPrecision::Fp16);
   static std::shared_ptr<const PlatosKeyGpu> load(const std::filesystem::path& safetensors_path,
                                                   const std::filesystem::path& metadata_json_path,
-                                                  int expected_in_dim = 0, void* cuda_stream = nullptr);
+                                                  int expected_in_dim = 0, void* cuda_stream = nullptr,
+                                                  PlatosKeyPrecision precision = PlatosKeyPrecision::Fp16);
 
   [[nodiscard]] const std::shared_ptr<const PlatosKey>& key() const noexcept { return key_; }
   [[nodiscard]] const PlatosKeyMetadata& metadata() const noexcept { return key_->metadata(); }
+  [[nodiscard]] PlatosKeyPrecision precision() const noexcept;
   [[nodiscard]] int in_dim() const noexcept { return key_->in_dim(); }
   [[nodiscard]] int out_dim() const noexcept { return key_->out_dim(); }
   [[nodiscard]] std::size_t device_bytes() const noexcept;

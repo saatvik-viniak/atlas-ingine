@@ -1958,17 +1958,10 @@ Eg2CudaBackend::Eg2CudaBackend(const ingine::model::RuntimeOptions& options)
 
   if (!options.platos_key.empty()) {
     platos_key_ = PlatosKey::load(options.platos_key, options.platos_key_metadata, 0);
-    const int expected_dim = platos_key_->metadata().expected_tap_layer.has_value()
-                                 ? config_.hidden_size
-                                 : (platos_key_->metadata().requires_final_layer ? config_.embedding_dim : 0);
-    if (expected_dim == 0 && platos_key_->in_dim() != config_.hidden_size &&
-        platos_key_->in_dim() != config_.embedding_dim) {
-      throw std::invalid_argument("EmbeddingGemma2: platos_key d_in (" + std::to_string(platos_key_->in_dim()) +
-                                  ") matches neither hidden_size (" + std::to_string(config_.hidden_size) +
-                                  ") nor embedding_dim (" + std::to_string(config_.embedding_dim) + ")");
-    }
-    platos_key_->validate_binding(model_id_, model_family(), expected_dim, config_.num_hidden_layers);
-    impl_->platos_key_gpu = PlatosKeyGpu::create(platos_key_, impl_->stream);
+    platos_key_->validate_binding(model_id_, model_family(), config_.embedding_dim, config_.num_hidden_layers,
+                                  config_.hidden_size);
+    const PlatosKeyPrecision pk_prec = use_bf16_ ? PlatosKeyPrecision::Bf16 : PlatosKeyPrecision::Fp32;
+    impl_->platos_key_gpu = PlatosKeyGpu::create(platos_key_, impl_->stream, pk_prec);
   }
 
   caps_.family = model::ModelFamily::EmbeddingGemma2;
@@ -2018,14 +2011,20 @@ ingine::model::GenerateStats Eg2CudaBackend::generate(std::span<const std::int32
   throw std::invalid_argument("EmbeddingGemma2 is an embeddings-only encoder; use POST /v1/embeddings");
 }
 
+std::optional<PlatosKeyPrecision> Eg2CudaBackend::platos_key_precision() const noexcept {
+  if (!impl_ || !impl_->platos_key_gpu) return std::nullopt;
+  return impl_->platos_key_gpu->precision();
+}
+
 ingine::model::ResidencyReport Eg2CudaBackend::residency_report() const {
   model::ResidencyReport r;
   const std::uint64_t text_bytes = use_bf16_ ? impl_->w_bf16.total_bytes : impl_->w_f32.total_bytes;
   const std::uint64_t vis_bytes = has_vision_ ? (use_bf16_ ? impl_->v_bf16.total_bytes : impl_->v_f32.total_bytes) : 0;
   const std::uint64_t aud_bytes = has_audio_ ? (use_bf16_ ? impl_->a_bf16.total_bytes : impl_->a_f32.total_bytes) : 0;
+  const std::uint64_t pk_bytes = impl_->platos_key_gpu ? impl_->platos_key_gpu->device_bytes() : 0;
   const std::uint64_t wbytes = text_bytes + vis_bytes + aud_bytes;
   r.weights_device_bytes = wbytes;
-  r.device_bytes = wbytes + impl_->lt_workspace.bytes();
+  r.device_bytes = wbytes + pk_bytes + impl_->lt_workspace.bytes();
   return r;
 }
 

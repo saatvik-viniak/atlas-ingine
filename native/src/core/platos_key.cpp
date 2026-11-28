@@ -810,15 +810,42 @@ std::shared_ptr<const PlatosKey> PlatosKey::load_with_json(const std::filesystem
 }
 
 void PlatosKey::validate_binding(std::string_view active_model_id, std::string_view active_model_family,
-                                 int active_embedding_dim, int active_num_tap_layers) const {
+                                 int active_embedding_dim, int active_num_tap_layers,
+                                 int active_tap_embedding_dim) const {
   (void)active_model_family;
   if (meta_.is_multi_tap) {
     throw std::invalid_argument("platos_key: multi-tap concat spec '" + meta_.tap_spec +
                                 "' is not supported by single-tap /v1/embeddings");
   }
-  if (active_embedding_dim > 0 && meta_.d_in != active_embedding_dim) {
-    throw std::invalid_argument("platos_key: donor dim mismatch (key d_in=" + std::to_string(meta_.d_in) +
-                                ", active model embedding_dim=" + std::to_string(active_embedding_dim) + ")");
+  const int tap_dim = (active_tap_embedding_dim > 0) ? active_tap_embedding_dim : active_embedding_dim;
+  if (meta_.expected_tap_layer.has_value()) {
+    if (tap_dim > 0 && meta_.d_in != tap_dim) {
+      throw std::invalid_argument("platos_key: donor dim mismatch for intermediate tap (key d_in=" +
+                                  std::to_string(meta_.d_in) + ", active model tap_embedding_dim=" +
+                                  std::to_string(tap_dim) + ")");
+    }
+  } else if (meta_.requires_final_layer) {
+    if (active_embedding_dim > 0 && meta_.d_in != active_embedding_dim) {
+      throw std::invalid_argument("platos_key: donor dim mismatch for final layer (key d_in=" +
+                                  std::to_string(meta_.d_in) + ", active model embedding_dim=" +
+                                  std::to_string(active_embedding_dim) + ")");
+    }
+  } else {
+    const bool has_final = (active_embedding_dim > 0);
+    const bool has_tap = (tap_dim > 0);
+    if (has_final || has_tap) {
+      const bool match_final = has_final && (meta_.d_in == active_embedding_dim);
+      const bool match_tap = has_tap && (meta_.d_in == tap_dim);
+      if (!match_final && !match_tap) {
+        if (has_final && (!has_tap || tap_dim == active_embedding_dim)) {
+          throw std::invalid_argument("platos_key: donor dim mismatch (key d_in=" + std::to_string(meta_.d_in) +
+                                      ", active model embedding_dim=" + std::to_string(active_embedding_dim) + ")");
+        }
+        throw std::invalid_argument("platos_key: donor dim mismatch (key d_in=" + std::to_string(meta_.d_in) +
+                                    ", active model tap_embedding_dim=" + std::to_string(tap_dim) +
+                                    ", embedding_dim=" + std::to_string(active_embedding_dim) + ")");
+      }
+    }
   }
   if (meta_.expected_tap_layer.has_value() && active_num_tap_layers > 0) {
     if (*meta_.expected_tap_layer < 0 || *meta_.expected_tap_layer >= active_num_tap_layers) {

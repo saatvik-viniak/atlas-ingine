@@ -431,21 +431,19 @@ Eg2CpuBackend::Eg2CpuBackend(const ingine::model::RuntimeOptions& options)
   if (!options.platos_key.empty()) {
     platos_key_ = PlatosKey::load(options.platos_key, options.platos_key_metadata, 0);
     const Eg2Config& cfg = encoder_.config();
-    const int expected_dim = platos_key_->metadata().expected_tap_layer.has_value()
-                                 ? cfg.hidden_size
-                                 : (platos_key_->metadata().requires_final_layer ? cfg.embedding_dim : 0);
-    if (expected_dim == 0 && platos_key_->in_dim() != cfg.hidden_size && platos_key_->in_dim() != cfg.embedding_dim) {
-      throw std::invalid_argument("EmbeddingGemma2: platos_key d_in (" + std::to_string(platos_key_->in_dim()) +
-                                  ") matches neither hidden_size (" + std::to_string(cfg.hidden_size) +
-                                  ") nor embedding_dim (" + std::to_string(cfg.embedding_dim) + ")");
-    }
-    platos_key_->validate_binding(model_id_, model_family(), expected_dim, cfg.num_hidden_layers);
+    platos_key_->validate_binding(model_id_, model_family(), cfg.embedding_dim, cfg.num_hidden_layers,
+                                  cfg.hidden_size);
   }
   init_metadata();
 }
 
 Eg2CpuBackend::Eg2CpuBackend(Eg2TextWeightsF32 weights, int max_ctx, std::shared_ptr<const PlatosKey> platos_key)
     : encoder_(std::move(weights)), platos_key_(std::move(platos_key)), max_ctx_(max_ctx) {
+  if (platos_key_) {
+    const Eg2Config& cfg = encoder_.config();
+    platos_key_->validate_binding(model_id_, model_family(), cfg.embedding_dim, cfg.num_hidden_layers,
+                                  cfg.hidden_size);
+  }
   init_metadata();
 }
 

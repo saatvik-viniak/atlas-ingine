@@ -959,8 +959,16 @@ void test_http_400_validation() {
   check_400(Json{{"input", "ok"}, {"normalize", "true"}}.dump(), "normalize");
   check_400(Json{{"input", "ok"}, {"tap_layer", -1}}.dump(), "tap_layer");
   check_400(Json{{"input", "ok"}, {"tap_layer", 48}}.dump(), "tap_layer");
+  check_400(Json{{"input", "ok"}, {"tap_layer", 4294967319ULL}}.dump(), "tap_layer");     // (1<<32)+23 narrowing trap
+  check_400(Json{{"input", "ok"}, {"tap_layer", -4294967273LL}}.dump(), "tap_layer");     // -(1<<32)+23 narrowing trap
   check_400(Json{{"input", "ok"}, {"tap_layer", 1.5}}.dump(), "tap_layer");
   check_400(Json{{"input", "ok"}, {"tap_layer", "31"}}.dump(), "tap_layer");
+  check_400(Json{{"input", "ok"}, {"dimensions", 0}}.dump(), "dimensions");
+  check_400(Json{{"input", "ok"}, {"dimensions", -64}}.dump(), "dimensions");
+  check_400(Json{{"input", "ok"}, {"dimensions", 4294967360ULL}}.dump(), "dimensions");   // (1<<32)+64 narrowing trap
+  check_400(Json{{"input", "ok"}, {"dimensions", -4294967232LL}}.dump(), "dimensions");   // -(1<<32)+64 narrowing trap
+  check_400(Json{{"input", "ok"}, {"dimensions", 18446744073709551615ULL}}.dump(), "dimensions");
+  check_400(Json{{"input", "ok"}, {"dimensions", 4294967360.0}}.dump(), "dimensions");
   check_400(Json{{"input", "ok"}, {"platos_key", "yes"}}.dump(), "platos_key");
   check_400(Json{{"input", "ok"}, {"platos_key", true}}.dump(), "platos_key");
 

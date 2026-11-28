@@ -413,6 +413,7 @@ int main(int argc, char** argv) {
         efake->set_supports_images(false);
         efake->set_supports_audio(false);
         efake->set_embedding_dim(eg2_cfg.embedding_dim);
+        efake->set_tap_embedding_dim(eg2_cfg.hidden_size);
         efake->set_num_tap_layers(eg2_cfg.num_hidden_layers);
         efake->set_matryoshka_dims(eg2_cfg.matryoshka_dims);
         efake->set_embedding_prompt_prefixes(eg2_cfg.prompts);

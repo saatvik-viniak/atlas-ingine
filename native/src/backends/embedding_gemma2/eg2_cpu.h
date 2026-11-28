@@ -73,6 +73,7 @@ class Eg2CpuBackend final : public ingine::model::ModelBackend {
 
   bool supports_embeddings() const override { return true; }
   int embedding_dim() const override { return encoder_.config().embedding_dim; }
+  int tap_embedding_dim() const override { return encoder_.config().hidden_size; }
   int num_tap_layers() const override { return encoder_.config().num_hidden_layers; }
   std::vector<int> matryoshka_dims() const override { return encoder_.config().matryoshka_dims; }
   std::map<std::string, std::string> embedding_prompt_prefixes() const override { return encoder_.config().prompts; }

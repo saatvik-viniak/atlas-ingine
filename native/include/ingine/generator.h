@@ -431,6 +431,9 @@ class Generator {
   // ---- Zero-KV, no-lm_head batched embedding interface (POST /v1/embeddings)
   virtual bool supports_embeddings() const { return false; }
   virtual int embedding_dim() const { return 0; }
+  // Hidden width at intermediate early-exit tap layers (equals embedding_dim() on models without post-pool projection;
+  // differs on EmbeddingGemma 2 where hidden_size=512 at tap layers and embedding_dim=768 after embedding_projection).
+  virtual int tap_embedding_dim() const { return embedding_dim(); }
   virtual int num_tap_layers() const { return 0; }
   virtual std::vector<int> matryoshka_dims() const { return {}; }
   virtual std::map<std::string, std::string> embedding_prompt_prefixes() const { return {}; }

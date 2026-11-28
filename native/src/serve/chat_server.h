@@ -87,6 +87,7 @@ class ChatServer {
   const bool is_encoder_only_;
   const bool supports_embeddings_;
   const int embedding_dim_;
+  const int tap_embedding_dim_;
   const int num_tap_layers_;
   const std::vector<int> matryoshka_dims_;
   const std::map<std::string, std::string> embedding_prompt_prefixes_;

@@ -9,10 +9,12 @@
 #include "backends/embedding_gemma2/eg2_config.h"
 #include "backends/embedding_gemma2/eg2_cpu.h"
 #include "backends/embedding_gemma2/eg2_manifest.h"
+#include "core/sha256.h"
 #include "engine/fake_generator.h"
 #include "ingine/model_backend.h"
 #include "ingine/platos_key.h"
 #include "serve/chat_server.h"
+#include "serve/openai.h"
 #include "text/chat.h"
 #include "text/tokenizer.h"
 
@@ -23,8 +25,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -57,6 +61,104 @@ double l2_norm(const std::vector<float>& v) { return std::sqrt(dot_f32(v, v)); }
 
 double cosine_sim(const std::vector<float>& a, const std::vector<float>& b) {
   return dot_f32(a, b) / (l2_norm(a) * l2_norm(b));
+}
+
+std::string base64_encode(const std::vector<std::uint8_t>& bytes) {
+  static constexpr char kAlpha[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((bytes.size() + 2) / 3) * 4);
+  for (std::size_t i = 0; i < bytes.size(); i += 3) {
+    const std::uint32_t b0 = bytes[i];
+    const std::uint32_t b1 = (i + 1 < bytes.size()) ? bytes[i + 1] : 0u;
+    const std::uint32_t b2 = (i + 2 < bytes.size()) ? bytes[i + 2] : 0u;
+    const std::uint32_t t = (b0 << 16) | (b1 << 8) | b2;
+    out.push_back(kAlpha[(t >> 18) & 0x3fu]);
+    out.push_back(kAlpha[(t >> 12) & 0x3fu]);
+    out.push_back(i + 1 < bytes.size() ? kAlpha[(t >> 6) & 0x3fu] : '=');
+    out.push_back(i + 2 < bytes.size() ? kAlpha[t & 0x3fu] : '=');
+  }
+  return out;
+}
+
+// Builds a minimal valid uncompressed 24-bit RGB BMP data URI (W x H) for CPU request-validation tests.
+std::string make_bmp_data_uri(int width, int height) {
+  const int row_stride = ((width * 3) + 3) & ~3;
+  const std::uint32_t pix_bytes = static_cast<std::uint32_t>(row_stride * height);
+  const std::uint32_t file_bytes = 54u + pix_bytes;
+  std::vector<std::uint8_t> bmp(file_bytes, 0u);
+  bmp[0] = 'B';
+  bmp[1] = 'M';
+  std::memcpy(bmp.data() + 2, &file_bytes, 4);
+  const std::uint32_t pix_off = 54u;
+  std::memcpy(bmp.data() + 10, &pix_off, 4);
+  const std::uint32_t dib_sz = 40u;
+  std::memcpy(bmp.data() + 14, &dib_sz, 4);
+  const std::int32_t w32 = width, h32 = height;
+  std::memcpy(bmp.data() + 18, &w32, 4);
+  std::memcpy(bmp.data() + 22, &h32, 4);
+  const std::uint16_t planes = 1u, bpp = 24u;
+  std::memcpy(bmp.data() + 26, &planes, 2);
+  std::memcpy(bmp.data() + 28, &bpp, 2);
+  std::memcpy(bmp.data() + 34, &pix_bytes, 4);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const std::size_t off = 54u + static_cast<std::size_t>(y) * static_cast<std::size_t>(row_stride) +
+                              static_cast<std::size_t>(x) * 3u;
+      bmp[off + 0] = static_cast<std::uint8_t>((x * 7 + y) & 0xff);
+      bmp[off + 1] = static_cast<std::uint8_t>((x + y * 5) & 0xff);
+      bmp[off + 2] = static_cast<std::uint8_t>((x * 3 + y * 3) & 0xff);
+    }
+  }
+  return "data:image/bmp;base64," + base64_encode(bmp);
+}
+
+// Writes a valid F32 Plato's Key R [d_in, d_out] (+ optional donor_mean, target_mean, scale) safetensors file
+// and returns its exact lowercase 64-hex SHA-256.
+std::string write_f32_platos_key(const std::filesystem::path& path, int d_in, int d_out, int seed,
+                                 const std::map<std::string, std::string>& meta = {}, bool with_affine = true) {
+  std::vector<float> R(static_cast<std::size_t>(d_in) * static_cast<std::size_t>(d_out));
+  for (std::size_t i = 0; i < R.size(); ++i) {
+    R[i] = static_cast<float>(std::sin(static_cast<double>(i + 1) * 0.137 + static_cast<double>(seed) * 0.71)) * 0.25f;
+  }
+  std::vector<float> dm(static_cast<std::size_t>(d_in)), tm(static_cast<std::size_t>(d_out));
+  for (int i = 0; i < d_in; ++i) dm[i] = static_cast<float>(std::cos(static_cast<double>(i + seed) * 0.19)) * 0.05f;
+  for (int j = 0; j < d_out; ++j) tm[j] = static_cast<float>(std::sin(static_cast<double>(j + seed) * 0.31)) * 0.1f;
+  const std::vector<float> sc = {1.15f};
+
+  nlohmann::ordered_json hdr = nlohmann::ordered_json::object();
+  if (!meta.empty()) {
+    nlohmann::ordered_json m = nlohmann::ordered_json::object();
+    for (const auto& [k, v] : meta) m[k] = v;
+    hdr["__metadata__"] = std::move(m);
+  }
+  std::vector<std::uint8_t> payload;
+  auto add_tensor = [&](const std::string& name, const std::vector<std::int64_t>& shape, const std::vector<float>& vals) {
+    const std::uint64_t b = payload.size();
+    const std::size_t nb = vals.size() * sizeof(float);
+    payload.resize(payload.size() + nb);
+    std::memcpy(payload.data() + b, vals.data(), nb);
+    const std::uint64_t e = payload.size();
+    hdr[name] = {{"dtype", "F32"}, {"shape", shape}, {"data_offsets", {b, e}}};
+  };
+  add_tensor("R", {d_in, d_out}, R);
+  if (with_affine) {
+    add_tensor("donor_mean", {d_in}, dm);
+    add_tensor("target_mean", {d_out}, tm);
+    add_tensor("scale", {1}, sc);
+  }
+  const std::string hdr_str = hdr.dump();
+  const std::uint64_t hdr_len = static_cast<std::uint64_t>(hdr_str.size());
+  std::vector<std::uint8_t> file_bytes(8 + hdr_str.size() + payload.size());
+  for (int i = 0; i < 8; ++i) file_bytes[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>((hdr_len >> (8 * i)) & 0xffu);
+  std::memcpy(file_bytes.data() + 8, hdr_str.data(), hdr_str.size());
+  std::memcpy(file_bytes.data() + 8 + hdr_str.size(), payload.data(), payload.size());
+
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  CHECK(static_cast<bool>(out));
+  out.write(reinterpret_cast<const char*>(file_bytes.data()), static_cast<std::streamsize>(file_bytes.size()));
+  out.flush();
+  CHECK(static_cast<bool>(out));
+  return ingine::sha256_hex(ingine::sha256_bytes(file_bytes.data(), file_bytes.size()));
 }
 
 std::filesystem::path find_eg2_model_dir() {
@@ -397,6 +499,395 @@ void test_real_checkpoint_tokenizer_manifest_http_and_oracle(const std::filesyst
 
   server.stop();
   std::printf("[PASS] real checkpoint CPU FP32 oracle & live HTTP ChatServer verified\n");
+
+  // 5) Finding (1): EG2 intermediate (512-d) & final (768-d) Plato's Key HTTP binding + mismatched controls
+  {
+    const auto tmp = std::filesystem::temp_directory_path() / "ingine_eg2_cpu_platos_key_968";
+    std::filesystem::remove_all(tmp);
+    std::filesystem::create_directories(tmp);
+
+    // Baseline unkeyed tap_layer=2 (512d) and final (768d) unnormalized embeddings for exact analytical checks
+    const auto ids_q = tok.encode_with_post_processor("What causes the northern lights?", false);
+    ingine::model::EmbeddingRequest r_tap2;
+    r_tap2.inputs = {ids_q};
+    r_tap2.tap_layer = 2;
+    r_tap2.normalize = false;
+    const auto ref_tap2 = real_backend.embed(r_tap2).embeddings[0];
+    CHECK(ref_tap2.size() == 512);
+
+    ingine::model::EmbeddingRequest r_fin;
+    r_fin.inputs = {ids_q};
+    r_fin.normalize = false;
+    const auto ref_fin = real_backend.embed(r_fin).embeddings[0];
+    CHECK(ref_fin.size() == 768);
+
+    // (a) Valid F32 [512, 2] R cartridge bound to visit_2 (matches astartes-maxima's exact repro!)
+    const auto k512_path = tmp / "eg2_512x2_visit2.safetensors";
+    const auto k512_meta = tmp / "eg2_512x2_visit2.json";
+    const std::string sha512 = write_f32_platos_key(k512_path, 512, 2, 11, {{"format", "platos_key_v1"}});
+    {
+      std::ofstream mf(k512_meta);
+      mf << Json{{"cartridge_id", "eg2-visit2-512x2"},
+                 {"cartridge_sha256", sha512},
+                 {"donor_model_id", "google/embeddinggemma-2"},
+                 {"tap_spec", "visit_2"},
+                 {"d_donor", 512},
+                 {"d_target", 2}}
+                .dump();
+    }
+    {
+      ingine::model::RuntimeOptions o512 = opts;
+      o512.platos_key = k512_path;
+      o512.platos_key_metadata = k512_meta;
+      Eg2CpuBackend b512(o512);
+      CHECK(b512.tap_embedding_dim() == 512);
+      CHECK(b512.embedding_dim() == 768);
+
+      // ChatServer with mismatched --model-id override must STILL fail closed!
+      bool threw_override = false;
+      try {
+        ingine::serve::ServerOptions bad_sopts = sopts;
+        bad_sopts.model_id = "wrong-donor-model";
+        ingine::serve::ChatServer bad_srv(b512, fmt, bad_sopts);
+      } catch (const std::invalid_argument&) {
+        threw_override = true;
+      }
+      CHECK(threw_override);
+
+      ingine::serve::ChatServer s512(b512, fmt, sopts);
+      CHECK(s512.bind("127.0.0.1", 0));
+      s512.start();
+      httplib::Client c512("127.0.0.1", s512.port());
+      c512.set_read_timeout(120, 0);
+
+      auto h = c512.Get("/health");
+      CHECK(h && h->status == 200);
+      const Json hj = Json::parse(h->body);
+      CHECK(hj["platos_key_loaded"] == true && hj["platos_key_out_dim"] == 2 && hj["platos_key_tap_layer"] == 2);
+
+      // Positive HTTP 200 at tap_layer=2 with cartridge pins
+      const Json req_ok{{"input", "What causes the northern lights?"},
+                        {"tap_layer", 2},
+                        {"platos_key", true},
+                        {"cartridge_id", "eg2-visit2-512x2"},
+                        {"cartridge_sha256", sha512},
+                        {"normalize", false}};
+      auto r_ok = c512.Post("/v1/embeddings", req_ok.dump(), "application/json");
+      CHECK(r_ok && r_ok->status == 200);
+      const auto got_raw = Json::parse(r_ok->body)["data"][0]["embedding"].get<std::vector<float>>();
+      CHECK(got_raw.size() == 2);
+      std::vector<float> exp_raw(2, 0.0f);
+      b512.platos_key()->project_cpu(ref_tap2.data(), 1, exp_raw.data(), false);
+      for (int j = 0; j < 2; ++j) CHECK(std::abs(got_raw[j] - exp_raw[j]) < 1e-5f);
+
+      // Mismatched HTTP controls -> 400
+      auto r_notap = c512.Post("/v1/embeddings", R"({"input":"hi","platos_key":true})", "application/json");
+      CHECK(r_notap && r_notap->status == 400 && Json::parse(r_notap->body)["error"]["param"] == "tap_layer");
+      auto r_badtap = c512.Post("/v1/embeddings", R"({"input":"hi","tap_layer":3,"platos_key":true})", "application/json");
+      CHECK(r_badtap && r_badtap->status == 400 && Json::parse(r_badtap->body)["error"]["param"] == "tap_layer");
+      auto r_badid = c512.Post("/v1/embeddings",
+                               R"({"input":"hi","tap_layer":2,"platos_key":true,"cartridge_id":"wrong"})",
+                               "application/json");
+      CHECK(r_badid && r_badid->status == 400 && Json::parse(r_badid->body)["error"]["param"] == "cartridge_id");
+      auto r_badsha = c512.Post("/v1/embeddings",
+                                Json{{"input", "hi"},
+                                     {"tap_layer", 2},
+                                     {"platos_key", true},
+                                     {"cartridge_sha256", std::string(64, '0')}}
+                                    .dump(),
+                                "application/json");
+      CHECK(r_badsha && r_badsha->status == 400 && Json::parse(r_badsha->body)["error"]["param"] == "cartridge_sha256");
+      s512.stop();
+    }
+
+    // (b) Valid F32 [768, 2] R cartridge bound to final_normed
+    const auto k768_path = tmp / "eg2_768x2_final.safetensors";
+    const auto k768_meta = tmp / "eg2_768x2_final.json";
+    const std::string sha768 = write_f32_platos_key(k768_path, 768, 2, 23, {{"format", "platos_key_v1"}});
+    {
+      std::ofstream mf(k768_meta);
+      mf << Json{{"cartridge_id", "eg2-final-768x2"},
+                 {"cartridge_sha256", sha768},
+                 {"donor_model_id", "google/embeddinggemma-2"},
+                 {"tap_spec", "final_normed"},
+                 {"d_donor", 768},
+                 {"d_target", 2}}
+                .dump();
+    }
+    {
+      ingine::model::RuntimeOptions o768 = opts;
+      o768.platos_key = k768_path;
+      o768.platos_key_metadata = k768_meta;
+      Eg2CpuBackend b768(o768);
+      ingine::serve::ChatServer s768(b768, fmt, sopts);
+      CHECK(s768.bind("127.0.0.1", 0));
+      s768.start();
+      httplib::Client c768("127.0.0.1", s768.port());
+      c768.set_read_timeout(120, 0);
+
+      const Json req_ok{{"input", "What causes the northern lights?"},
+                        {"platos_key", true},
+                        {"cartridge_id", "eg2-final-768x2"},
+                        {"cartridge_sha256", sha768},
+                        {"normalize", false}};
+      auto r_ok = c768.Post("/v1/embeddings", req_ok.dump(), "application/json");
+      CHECK(r_ok && r_ok->status == 200);
+      const auto got_raw = Json::parse(r_ok->body)["data"][0]["embedding"].get<std::vector<float>>();
+      CHECK(got_raw.size() == 2);
+      std::vector<float> exp_raw(2, 0.0f);
+      b768.platos_key()->project_cpu(ref_fin.data(), 1, exp_raw.data(), false);
+      for (int j = 0; j < 2; ++j) CHECK(std::abs(got_raw[j] - exp_raw[j]) < 1e-5f);
+
+      // Final-bound key must reject intermediate tap_layer with HTTP 400
+      auto r_badtap = c768.Post("/v1/embeddings", R"({"input":"hi","tap_layer":2,"platos_key":true})", "application/json");
+      CHECK(r_badtap && r_badtap->status == 400 && Json::parse(r_badtap->body)["error"]["param"] == "tap_layer");
+      s768.stop();
+    }
+
+    // (c) Unbound [512, 2] key: HTTP 200 with tap_layer=2, HTTP 400 (NOT 500) when omitting tap_layer
+    {
+      ingine::model::RuntimeOptions ou = opts;
+      ou.platos_key = k512_path;
+      Eg2CpuBackend bu(ou);
+      ingine::serve::ChatServer su(bu, fmt, sopts);
+      CHECK(su.bind("127.0.0.1", 0));
+      su.start();
+      httplib::Client cu("127.0.0.1", su.port());
+      cu.set_read_timeout(120, 0);
+      auto r_ok = cu.Post("/v1/embeddings", R"({"input":"hi","tap_layer":2,"platos_key":true})", "application/json");
+      CHECK(r_ok && r_ok->status == 200);
+      auto r_400 = cu.Post("/v1/embeddings", R"({"input":"hi","platos_key":true})", "application/json");
+      CHECK(r_400 && r_400->status == 400 && Json::parse(r_400->body)["error"]["param"] == "tap_layer");
+      su.stop();
+    }
+
+    // (d) Mismatched startup controls: ALL must throw fail-closed!
+    auto expect_startup_reject = [&](const std::filesystem::path& kp, const std::filesystem::path& mp) {
+      bool threw = false;
+      try {
+        ingine::model::RuntimeOptions ob = opts;
+        ob.platos_key = kp;
+        ob.platos_key_metadata = mp;
+        Eg2CpuBackend bb(ob);
+        ingine::serve::ChatServer sb(bb, fmt, sopts);
+      } catch (const std::invalid_argument&) {
+        threw = true;
+      }
+      CHECK(threw);
+    };
+    // 768-d key bound to intermediate visit_2 -> REJECT!
+    const auto m_768_visit2 = tmp / "bad_768_visit2.json";
+    {
+      std::ofstream mf(m_768_visit2);
+      mf << Json{{"cartridge_sha256", sha768}, {"donor_model_id", "google/embeddinggemma-2"}, {"tap_spec", "visit_2"}}.dump();
+    }
+    expect_startup_reject(k768_path, m_768_visit2);
+    // 512-d key bound to final_normed -> REJECT!
+    const auto m_512_final = tmp / "bad_512_final.json";
+    {
+      std::ofstream mf(m_512_final);
+      mf << Json{{"cartridge_sha256", sha512}, {"donor_model_id", "google/embeddinggemma-2"}, {"tap_spec", "final_normed"}}.dump();
+    }
+    expect_startup_reject(k512_path, m_512_final);
+    // 256-d unbound key -> REJECT!
+    const auto k256_path = tmp / "bad_256.safetensors";
+    (void)write_f32_platos_key(k256_path, 256, 2, 31);
+    expect_startup_reject(k256_path, {});
+    // 512-d visit_2 key bound to wrong donor (Inkling-2-Mini) -> REJECT!
+    const auto m_wrong_donor = tmp / "bad_wrong_donor.json";
+    {
+      std::ofstream mf(m_wrong_donor);
+      mf << Json{{"cartridge_sha256", sha512}, {"donor_model_id", "Inkling-2-Mini"}, {"tap_spec", "visit_2"}}.dump();
+    }
+    expect_startup_reject(k512_path, m_wrong_donor);
+
+    std::filesystem::remove_all(tmp);
+    std::printf("[PASS] EG2 intermediate (512d) + final (768d) Plato's Key HTTP & mismatched controls verified\n");
+  }
+
+  // 6) Finding (3): Public embeddings parser limits (max_images, max_total_tokens incl. video frames across batch)
+  //    + integer narrowing / representability rejection BEFORE conversion to int!
+  {
+    const std::string bmp_uri = make_bmp_data_uri(48, 48);
+    // For 48x48 square image: max_soft_tokens=70 -> 384x384 -> 64 soft tokens; max_soft_tokens=140 -> 528x528 -> 121;
+    // max_soft_tokens=280 -> 768x768 -> 256 soft tokens.
+    ingine::serve::EmbeddingParseOptions popts;
+    popts.max_model_len = 8192;
+    popts.embedding_dim = 768;
+    popts.tap_embedding_dim = 512;
+    popts.num_tap_layers = 24;
+    popts.supports_images = true;
+    popts.supports_audio = true;
+    popts.matryoshka_dims = {768, 512, 256, 128};
+    popts.max_images = 2;
+    popts.max_total_tokens = 150;
+
+    auto expect_bad_req = [&](const Json& body, const std::string& expected_param,
+                              const ingine::serve::EmbeddingParseOptions& o) {
+      bool threw = false;
+      try {
+        (void)ingine::serve::parse_embedding_request(body, fmt, o);
+      } catch (const ingine::serve::BadRequest& e) {
+        CHECK(e.status == 400);
+        if (!expected_param.empty()) CHECK(e.param.has_value() && *e.param == expected_param);
+        threw = true;
+      }
+      CHECK(threw);
+    };
+
+    // Single image (64 soft tokens @ max_soft_tokens=70): accepted under max_images=2, max_total_tokens=150
+    {
+      const Json ok_img{{"input", Json::array({Json{{"type", "image_url"}, {"image_url", bmp_uri}, {"max_soft_tokens", 70}}})}};
+      const auto parsed = ingine::serve::parse_embedding_request(ok_img, fmt, popts);
+      CHECK(parsed.request.images.size() == 1 && parsed.request.images[0].size() == 1);
+    }
+
+    // Cross-batch max_images enforcement: item 0 has 1 image + item 1 has 2 video frames = 3 > max_images=2 -> REJECT!
+    {
+      const Json item0 = Json::array({Json{{"type", "image_url"}, {"image_url", bmp_uri}, {"max_soft_tokens", 70}}});
+      const Json item1 = Json::array({Json{{"type", "video"},
+                                           {"max_soft_tokens", 70},
+                                           {"frames", Json::array({bmp_uri, bmp_uri})}}});
+      const Json batch_3{{"input", Json::array({item0, item1})}};
+      // Exceeds max_images=2 (3 > 2)
+      expect_bad_req(batch_3, "input", popts);
+
+      // Raise max_images=3, keep max_total_tokens=150: 3 * 64 = 192 > 150 -> REJECT on max_total_tokens!
+      auto o_tok = popts;
+      o_tok.max_images = 3;
+      o_tok.max_total_tokens = 150;
+      expect_bad_req(batch_3, "input", o_tok);
+
+      // Raise max_total_tokens=192: exact boundary 3 images/frames & 192 tokens -> ACCEPT!
+      o_tok.max_total_tokens = 192;
+      const auto parsed = ingine::serve::parse_embedding_request(batch_3, fmt, o_tok);
+      CHECK(parsed.request.inputs.size() == 2);
+      CHECK(parsed.request.images.size() == 2);
+      CHECK(parsed.request.images[0].size() == 1 && parsed.request.images[1].size() == 2);
+
+      // max_images=0 rejects even 1 image or 1 video frame
+      auto o_zero = popts;
+      o_zero.max_images = 0;
+      expect_bad_req(Json{{"input", item0}}, "input", o_zero);
+      expect_bad_req(Json{{"input", Json::array({Json{{"type", "video"}, {"frames", Json::array({bmp_uri})}}})}},
+                     "input", o_zero);
+    }
+
+    // Single-item video max_images (3 frames > max_images=2) & max_total_tokens (2x121=242 > 150)
+    {
+      const Json vid3{{"input", Json::array({Json{{"type", "video"},
+                                                  {"max_soft_tokens", 70},
+                                                  {"frames", Json::array({bmp_uri, bmp_uri, bmp_uri})}}})}};
+      expect_bad_req(vid3, "input", popts);
+
+      const Json vid2_140{{"input", Json::array({Json{{"type", "video"},
+                                                      {"max_soft_tokens", 140},
+                                                      {"frames", Json::array({bmp_uri, bmp_uri})}}})}};
+      expect_bad_req(vid2_140, "input", popts);  // 2 frames <= max_images=2, but 242 tokens > max_total_tokens=150
+    }
+
+    // Integer narrowing / representability checks BEFORE conversion to int!
+    // 1) dimensions: (1ULL<<32)+768, (1ULL<<32)+256, -(1LL<<32)+256, UINT64_MAX, INT64_MAX, float overflow, tap_layer > 512
+    expect_bad_req(Json{{"input", "hi"}, {"dimensions", 4294968064ULL}}, "dimensions", popts);
+    expect_bad_req(Json{{"input", "hi"}, {"dimensions", 4294967552ULL}}, "dimensions", popts);
+    expect_bad_req(Json{{"input", "hi"}, {"dimensions", -4294967040LL}}, "dimensions", popts);
+    expect_bad_req(Json{{"input", "hi"}, {"dimensions", 18446744073709551615ULL}}, "dimensions", popts);
+    expect_bad_req(Json{{"input", "hi"}, {"dimensions", 9223372036854775807LL}}, "dimensions", popts);
+    expect_bad_req(Json{{"input", "hi"}, {"dimensions", 4294967552.0}}, "dimensions", popts);
+    expect_bad_req(Json{{"input", "hi"}, {"dimensions", 256.5}}, "dimensions", popts);
+    expect_bad_req(Json{{"input", "hi"}, {"dimensions", 0}}, "dimensions", popts);
+    expect_bad_req(Json{{"input", "hi"}, {"dimensions", -128}}, "dimensions", popts);
+    expect_bad_req(Json{{"input", "hi"}, {"tap_layer", 2}, {"dimensions", 600}}, "dimensions", popts);
+
+    // 2) image max_soft_tokens (top-level & nested image_url & outer-invalid + inner-valid)
+    auto o_wide = popts;
+    o_wide.max_images = 16;
+    o_wide.max_total_tokens = 32768;
+    expect_bad_req(
+        Json{{"input", Json::array({Json{{"type", "image_url"}, {"image_url", bmp_uri}, {"max_soft_tokens", 4294967576ULL}}})}},
+        "input", o_wide);  // (1<<32)+280
+    expect_bad_req(
+        Json{{"input", Json::array({Json{{"type", "image_url"}, {"image_url", bmp_uri}, {"max_soft_tokens", -4294967016LL}}})}},
+        "input", o_wide);  // -(1<<32)+280
+    expect_bad_req(
+        Json{{"input", Json::array({Json{{"type", "image_url"},
+                                         {"image_url", Json{{"url", bmp_uri}, {"max_soft_tokens", 4294967576ULL}}}}})}},
+        "input", o_wide);
+    expect_bad_req(
+        Json{{"input", Json::array({Json{{"type", "image_url"},
+                                         {"max_soft_tokens", 4294967576ULL},
+                                         {"image_url", Json{{"url", bmp_uri}, {"max_soft_tokens", 280}}}}})}},
+        "input", o_wide);
+    expect_bad_req(
+        Json{{"input", Json::array({Json{{"type", "image_url"}, {"image_url", bmp_uri}, {"max_soft_tokens", 280.0}}})}},
+        "input", o_wide);
+
+    // 3) video max_soft_tokens (video-level & per-frame object)
+    expect_bad_req(Json{{"input", Json::array({Json{{"type", "video"},
+                                                    {"max_soft_tokens", 4294967436ULL},
+                                                    {"frames", Json::array({bmp_uri})}}})}},
+                   "input", o_wide);  // (1<<32)+140
+    expect_bad_req(Json{{"input", Json::array({Json{{"type", "video"},
+                                                    {"max_soft_tokens", -4294967156LL},
+                                                    {"frames", Json::array({bmp_uri})}}})}},
+                   "input", o_wide);  // -(1<<32)+140
+    expect_bad_req(
+        Json{{"input", Json::array({Json{{"type", "video"},
+                                         {"frames", Json::array({Json{{"url", bmp_uri}, {"max_soft_tokens", 4294967436ULL}}})}}})}},
+        "input", o_wide);
+
+    // 4) tap_layer narrowing traps
+    expect_bad_req(Json{{"input", "hi"}, {"tap_layer", 4294967298ULL}}, "tap_layer", o_wide);
+    expect_bad_req(Json{{"input", "hi"}, {"tap_layer", -4294967294LL}}, "tap_layer", o_wide);
+
+    // 5) Live HTTP ChatServer carries ServerOptions::images.{max_images, max_total_tokens} into /v1/embeddings!
+    {
+      ingine::engine::FakeGenerator vfake(tok, "embeddinggemma-2-fake", 8192);
+      vfake.set_model_family("embedding_gemma2");
+      vfake.set_is_encoder_only(true);
+      vfake.set_supports_images(true);
+      vfake.set_embedding_dim(768);
+      vfake.set_tap_embedding_dim(512);
+      vfake.set_num_tap_layers(24);
+      vfake.set_matryoshka_dims({768, 512, 256, 128});
+      ingine::serve::ServerOptions vsopts;
+      vsopts.max_model_len = 8192;
+      vsopts.images.enabled = true;
+      vsopts.images.max_images = 2;
+      vsopts.images.max_total_tokens = 150;
+      ingine::serve::ChatServer vsrv(vfake, fmt, vsopts);
+      CHECK(vsrv.bind("127.0.0.1", 0));
+      vsrv.start();
+      httplib::Client vcli("127.0.0.1", vsrv.port());
+      vcli.set_read_timeout(30, 0);
+
+      // Valid 2-image batch totaling 128 tokens <= 150 -> HTTP 200
+      const Json item_img = Json::array({Json{{"type", "image_url"}, {"image_url", bmp_uri}, {"max_soft_tokens", 70}}});
+      auto r_ok = vcli.Post("/v1/embeddings", Json{{"input", Json::array({item_img, item_img})}}.dump(), "application/json");
+      CHECK(r_ok && r_ok->status == 200);
+
+      // 1 image + 2 video frames across batch = 3 > max_images=2 -> HTTP 400
+      const Json item_vid2 = Json::array({Json{{"type", "video"}, {"max_soft_tokens", 70}, {"frames", Json::array({bmp_uri, bmp_uri})}}});
+      auto r_lim_img = vcli.Post("/v1/embeddings", Json{{"input", Json::array({item_img, item_vid2})}}.dump(), "application/json");
+      CHECK(r_lim_img && r_lim_img->status == 400);
+
+      // 2 images @ max_soft_tokens=140 = 242 tokens > max_total_tokens=150 -> HTTP 400
+      const Json item_img140 = Json::array({Json{{"type", "image_url"}, {"image_url", bmp_uri}, {"max_soft_tokens", 140}}});
+      auto r_lim_tok = vcli.Post("/v1/embeddings", Json{{"input", Json::array({item_img140, item_img140})}}.dump(), "application/json");
+      CHECK(r_lim_tok && r_lim_tok->status == 400);
+
+      // Narrowing traps over live HTTP -> HTTP 400
+      auto r_dim_ovf = vcli.Post("/v1/embeddings", Json{{"input", "hi"}, {"dimensions", 4294967552ULL}}.dump(), "application/json");
+      CHECK(r_dim_ovf && r_dim_ovf->status == 400 && Json::parse(r_dim_ovf->body)["error"]["param"] == "dimensions");
+      auto r_mst_ovf = vcli.Post(
+          "/v1/embeddings",
+          Json{{"input", Json::array({Json{{"type", "image_url"}, {"image_url", bmp_uri}, {"max_soft_tokens", 4294967576ULL}}})}}.dump(),
+          "application/json");
+      CHECK(r_mst_ovf && r_mst_ovf->status == 400 && Json::parse(r_mst_ovf->body)["error"]["param"] == "input");
+      vsrv.stop();
+    }
+    std::printf("[PASS] Public embeddings parser limits (max_images/max_total_tokens incl. video) & int representability verified\n");
+  }
 }
 
 void test_phase2_vision_preprocess_and_synthetic_scatter() {

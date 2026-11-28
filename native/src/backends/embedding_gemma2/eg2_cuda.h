@@ -44,6 +44,7 @@ class Eg2CudaBackend final : public ingine::model::ModelBackend {
 
   bool supports_embeddings() const override { return true; }
   int embedding_dim() const override { return config_.embedding_dim; }
+  int tap_embedding_dim() const override { return config_.hidden_size; }
   int num_tap_layers() const override { return config_.num_hidden_layers; }
   std::vector<int> matryoshka_dims() const override { return config_.matryoshka_dims; }
   std::map<std::string, std::string> embedding_prompt_prefixes() const override { return config_.prompts; }
@@ -62,6 +63,7 @@ class Eg2CudaBackend final : public ingine::model::ModelBackend {
 
   const Eg2Config& config() const noexcept { return config_; }
   bool uses_bf16() const noexcept { return use_bf16_; }
+  std::optional<PlatosKeyPrecision> platos_key_precision() const noexcept;
 
  private:
   struct Impl;

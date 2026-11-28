@@ -90,6 +90,7 @@ struct ParsedEmbeddingRequest {
 struct EmbeddingParseOptions {
   int max_model_len = 0;
   int embedding_dim = 0;
+  int tap_embedding_dim = 0;     // intermediate tap dim when distinct from embedding_dim (0 => embedding_dim)
   int num_tap_layers = 0;
   bool has_platos_key = false;
   const PlatosKey* loaded_platos_key = nullptr;
@@ -98,6 +99,8 @@ struct EmbeddingParseOptions {
   int vision_soft_tokens_per_image = 280;
   int video_soft_tokens_per_frame = 140;
   image::Limits image_limits;
+  int max_images = 16;           // per-request image + video frame limit across the entire batch (<0 disables)
+  int max_total_tokens = 32768;  // per-request image + video soft token limit across the entire batch (<0 disables)
   std::vector<int> matryoshka_dims;
   std::map<std::string, std::string> prompt_prefixes;
 };
