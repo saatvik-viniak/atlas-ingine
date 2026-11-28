@@ -449,6 +449,266 @@ void test_atlas_extensions_and_platos_key_http() {
   CHECK(v_pk_norm.size() == D_OUT);
   CHECK(std::fabs(l2_norm(v_pk_norm) - 1.0) < 1e-5);
 
+  // Fail-closed checks: bound tap_layer=23 rejects omitted tap_layer and conflicting tap_layer=41 with HTTP 400!
+  {
+    const Response r_omit = http_req(
+        s->port(), "POST", "/v1/embeddings",
+        Json{{"input", p_a}, {"platos_key", true}, {"normalize", false}}.dump());
+    CHECK(r_omit.status == 400);
+    CHECK(Json::parse(r_omit.body)["error"]["param"] == "tap_layer");
+
+    const Response r_conflict = http_req(
+        s->port(), "POST", "/v1/embeddings",
+        Json{{"input", p_a}, {"tap_layer", 41}, {"platos_key", true}, {"normalize", false}}.dump());
+    CHECK(r_conflict.status == 400);
+    CHECK(Json::parse(r_conflict.body)["error"]["param"] == "tap_layer");
+
+    // Matching cartridge_sha256 succeeds; mismatched cartridge_sha256 fails closed with HTTP 400.
+    const std::string real_sha = loaded_key->metadata().file_sha256;
+    CHECK(real_sha.size() == 64);
+    CHECK(hj["platos_key_sha256"] == real_sha);
+    CHECK(hj["platos_key_tap_layer"] == 23);
+    CHECK(hj["platos_key_layout"] == "ridge_R");
+    const Response r_sha_ok = http_req(
+        s->port(), "POST", "/v1/embeddings",
+        Json{{"input", p_a}, {"tap_layer", 23}, {"platos_key", true}, {"cartridge_sha256", real_sha}}.dump());
+    CHECK(r_sha_ok.status == 200);
+
+    std::string bad_sha = real_sha;
+    bad_sha[0] = (bad_sha[0] == 'a') ? 'b' : 'a';
+    const Response r_sha_bad = http_req(
+        s->port(), "POST", "/v1/embeddings",
+        Json{{"input", p_a}, {"tap_layer", 23}, {"platos_key", true}, {"cartridge_sha256", bad_sha}}.dump());
+    CHECK(r_sha_bad.status == 400);
+    CHECK(Json::parse(r_sha_bad.body)["error"]["param"] == "cartridge_sha256");
+  }
+
+  std::filesystem::remove_all(tmp);
+}
+
+void test_cartridge_964_binding_and_layouts_fail_closed() {
+  const auto tmp = std::filesystem::temp_directory_path() / "ingine_test_embeddings_964_binding";
+  std::filesystem::remove_all(tmp);
+  std::filesystem::create_directories(tmp);
+
+  constexpr int D_IN = 64, D_OUT = 24, RANK = 8;
+  std::vector<float> R(D_IN * D_OUT), R2(D_IN * D_OUT), dm(D_IN), tm(D_OUT);
+  for (int i = 0; i < D_IN * D_OUT; ++i) {
+    R[i] = static_cast<float>((i % 11) - 5) * 0.0625f;
+    R2[i] = static_cast<float>((i % 13) - 6) * 0.0625f;
+  }
+  for (int i = 0; i < D_IN; ++i) dm[i] = static_cast<float>((i % 5) - 2) * 0.125f;
+  for (int j = 0; j < D_OUT; ++j) tm[j] = static_cast<float>((j % 7) - 3) * 0.25f;
+
+  // 1) Wrong same-width artifact: sidecar pins cartridge_sha256 of key A, loaded with key B -> fail-closed!
+  const auto p_a = tmp / "key_a.safetensors";
+  const auto p_b = tmp / "key_b.safetensors";
+  const auto m_a = tmp / "key_a.json";
+  write_safetensors(p_a, {{"R", "F32", {D_IN, D_OUT}, pack_f32(R)}}, {{"format", "platos_key_v1"}});
+  write_safetensors(p_b, {{"R", "F32", {D_IN, D_OUT}, pack_f32(R2)}}, {{"format", "platos_key_v1"}});
+  const auto ka = PlatosKey::load(p_a, D_IN);
+  const std::string sha_a = ka->metadata().file_sha256;
+  CHECK(sha_a.size() == 64);
+  {
+    std::ofstream mf(m_a);
+    mf << Json{{"cartridge_id", "inkling_test_cart"},
+               {"cartridge_sha256", sha_a},
+               {"donor_model_id", "thinkingmachines/Inkling-2-Mini"},
+               {"d_donor", D_IN},
+               {"d_target", D_OUT},
+               {"tap_spec", "visit_41"},
+               {"tap_layer", 41}}
+              .dump();
+  }
+  auto ka_pinned = PlatosKey::load(p_a, m_a, D_IN);
+  CHECK(ka_pinned->metadata().cartridge_id == "inkling_test_cart");
+  CHECK(ka_pinned->metadata().donor_model == "thinkingmachines/Inkling-2-Mini");
+  CHECK(ka_pinned->metadata().expected_tap_layer == std::optional<int>(41));
+
+  bool threw_wrong_artifact = false;
+  try {
+    (void)PlatosKey::load(p_b, m_a, D_IN);
+  } catch (const std::invalid_argument&) {
+    threw_wrong_artifact = true;
+  }
+  CHECK(threw_wrong_artifact);
+
+  // 2) Mismatched donor_model_id: Qwen3.8 or Ling-3.2 key loaded onto Inkling runtime -> fail-closed!
+  for (const std::string& bad_donor : {"Qwen/Qwen3.8-27B", "inclusionAI/Ling-3.2-air", "OtherModel-7B"}) {
+    const auto m_bad_donor = tmp / "bad_donor.json";
+    {
+      std::ofstream mf(m_bad_donor);
+      mf << Json{{"cartridge_sha256", sha_a},
+                 {"donor_model_id", bad_donor},
+                 {"d_donor", D_IN},
+                 {"d_target", D_OUT},
+                 {"tap_spec", "layer_31"},
+                 {"tap_layer", 31}}
+                .dump();
+    }
+    bool threw_donor = false;
+    try {
+      (void)make_served(1024, 8, p_a, m_bad_donor);
+    } catch (const std::invalid_argument&) {
+      threw_donor = true;
+    }
+    CHECK(threw_donor);
+  }
+
+  // 3) Conflicting tap_spec vs tap_layer in sidecar -> fail-closed at load!
+  {
+    const auto m_bad_tap = tmp / "bad_tap.json";
+    std::ofstream mf(m_bad_tap);
+    mf << Json{{"cartridge_sha256", sha_a}, {"tap_spec", "visit_10"}, {"tap_layer", 41}}.dump();
+    mf.close();
+    bool threw_conflict = false;
+    try {
+      (void)PlatosKey::load(p_a, m_bad_tap, D_IN);
+    } catch (const std::invalid_argument&) {
+      threw_conflict = true;
+    }
+    CHECK(threw_conflict);
+  }
+
+  // 4) Final-layer bound key (`tap_spec: "final_normed"`): accepts omitted tap_layer, rejects explicit tap_layer!
+  {
+    const auto m_final = tmp / "final.json";
+    std::ofstream mf(m_final);
+    mf << Json{{"cartridge_sha256", sha_a},
+               {"donor_model_id", "thinkingmachines/Inkling-2-Mini"},
+               {"d_donor", D_IN},
+               {"d_target", D_OUT},
+               {"tap_spec", "final_normed"}}
+              .dump();
+    mf.close();
+    auto sf = make_served(1024, 8, p_a, m_final);
+    const Response r_ok = http_req(sf->port(), "POST", "/v1/embeddings",
+                                   Json{{"input", "hello"}, {"platos_key", true}}.dump());
+    CHECK(r_ok.status == 200);
+    const Response r_bad = http_req(sf->port(), "POST", "/v1/embeddings",
+                                    Json{{"input", "hello"}, {"tap_layer", 23}, {"platos_key", true}}.dump());
+    CHECK(r_bad.status == 400);
+    CHECK(Json::parse(r_bad.body)["error"]["param"] == "tap_layer");
+  }
+
+  // 5) Factorized SVD layout (`U_r`, `V_r`) + affine Yue2 layout (`W_yue2`, `b_yue2`) numerical parity!
+  {
+    std::vector<float> U(D_IN * RANK), V(RANK * D_OUT);
+    for (int i = 0; i < D_IN * RANK; ++i) U[i] = std::sin(static_cast<float>(i + 1) * 0.17f) * 0.25f;
+    for (int i = 0; i < RANK * D_OUT; ++i) V[i] = std::cos(static_cast<float>(i + 1) * 0.23f) * 0.25f;
+    const auto p_svd = tmp / "key_svd.safetensors";
+    write_safetensors(p_svd,
+                      {{"U_r", "F32", {D_IN, RANK}, pack_f32(U)},
+                       {"V_r", "F32", {RANK, D_OUT}, pack_f32(V)},
+                       {"donor_mean", "F32", {D_IN}, pack_f32(dm)},
+                       {"target_mean", "F32", {D_OUT}, pack_f32(tm)},
+                       {"scale", "F32", {1}, pack_f32({1.5f})}},
+                      {{"format", "platos_key_svd_v1"}});
+    auto ksvd = PlatosKey::load(p_svd, D_IN);
+    CHECK(ksvd->metadata().tensor_layout == "svd_Ur_Vr");
+    CHECK(ksvd->metadata().svd_rank == RANK);
+    std::vector<float> x(D_IN), y(D_OUT, 0.0f);
+    for (int i = 0; i < D_IN; ++i) x[i] = std::cos(static_cast<float>(i) * 0.11f);
+    ksvd->project_cpu(x.data(), 1, y.data(), false);
+    for (int j = 0; j < D_OUT; ++j) {
+      double acc = 0.0;
+      for (int r = 0; r < RANK; ++r) {
+        double xr = 0.0;
+        for (int i = 0; i < D_IN; ++i) xr += (static_cast<double>(x[i]) - dm[i]) * U[i * RANK + r];
+        acc += xr * V[r * D_OUT + j];
+      }
+      const double ref = tm[j] + 1.5 * acc;
+      CHECK(std::fabs(static_cast<double>(y[j]) - ref) < 1e-4);
+    }
+
+    const auto p_yue = tmp / "key_yue2.safetensors";
+    write_safetensors(p_yue,
+                      {{"W_yue2", "F32", {D_IN, D_OUT}, pack_f32(R)}, {"b_yue2", "F32", {D_OUT}, pack_f32(tm)}},
+                      {{"format", "omni946-inkling-yue2-key/v1"}});
+    auto kyue = PlatosKey::load(p_yue, D_IN);
+    CHECK(kyue->metadata().tensor_layout == "affine_W_yue2");
+    std::vector<float> yy(D_OUT, 0.0f);
+    kyue->project_cpu(x.data(), 1, yy.data(), false);
+    for (int j = 0; j < D_OUT; ++j) {
+      double acc = tm[j];
+      for (int i = 0; i < D_IN; ++i) acc += static_cast<double>(x[i]) * R[i * D_OUT + j];
+      CHECK(std::fabs(static_cast<double>(yy[j]) - acc) < 1e-4);
+    }
+  }
+
+  // 6) Inkling forbidden_coord_d2027_zero_masked: zeros x[2027] BEFORE centering so +Inf/outliers never poison y!
+  {
+    constexpr int D_INK = 2304, D_OUT_S = 8;
+    std::vector<float> R_ink(D_INK * D_OUT_S, 0.0f);
+    for (int j = 0; j < D_OUT_S; ++j) {
+      R_ink[0 * D_OUT_S + j] = 1.0f;
+      R_ink[2027 * D_OUT_S + j] = 2.0f;
+    }
+    const auto p_ink = tmp / "key_d2027.safetensors";
+    const auto m_ink = tmp / "key_d2027.json";
+    write_safetensors(p_ink, {{"R", "F32", {D_INK, D_OUT_S}, pack_f32(R_ink)}}, {{"format", "platos_key_v1"}});
+    {
+      std::ofstream mf(m_ink);
+      mf << Json{{"forbidden_coord_d2027_zero_masked", true}}.dump();
+    }
+    auto kink = PlatosKey::load(p_ink, m_ink, D_INK);
+    CHECK(kink->metadata().forbidden_coord_d2027_zero_masked == true);
+    std::vector<float> x_ink(D_INK, 0.0f), y_ink(D_OUT_S, 0.0f);
+    x_ink[0] = 3.5f;
+    x_ink[2027] = std::numeric_limits<float>::infinity();
+    kink->project_cpu(x_ink.data(), 1, y_ink.data(), false);
+    for (int j = 0; j < D_OUT_S; ++j) {
+      CHECK(std::isfinite(y_ink[j]));
+      CHECK(std::fabs(y_ink[j] - 3.5f) < 1e-5f);
+    }
+  }
+
+  // 7) Unsupported layouts fail closed: anti_cart (`U_bad`), multi-tap `concat_all4`, half-SVD, unknown key.
+  {
+    const auto p_anti = tmp / "anti.safetensors";
+    write_safetensors(p_anti, {{"U_bad", "F32", {D_IN, RANK}, pack_f32(std::vector<float>(D_IN * RANK, 0.1f))}},
+                      {{"format", "atlas_anti_cart_v1"}});
+    bool threw_anti = false;
+    try {
+      (void)PlatosKey::load(p_anti, D_IN);
+    } catch (const std::invalid_argument&) {
+      threw_anti = true;
+    }
+    CHECK(threw_anti);
+
+    const auto m_concat = tmp / "concat.json";
+    std::ofstream mf(m_concat);
+    mf << Json{{"cartridge_sha256", sha_a}, {"tap_spec", "concat_all4"}}.dump();
+    mf.close();
+    bool threw_concat = false;
+    try {
+      (void)make_served(1024, 8, p_a, m_concat);
+    } catch (const std::invalid_argument&) {
+      threw_concat = true;
+    }
+    CHECK(threw_concat);
+
+    const auto p_half_svd = tmp / "half_svd.safetensors";
+    write_safetensors(p_half_svd, {{"U_r", "F32", {D_IN, RANK}, pack_f32(std::vector<float>(D_IN * RANK, 0.1f))}});
+    bool threw_half = false;
+    try {
+      (void)PlatosKey::load(p_half_svd, D_IN);
+    } catch (const std::invalid_argument&) {
+      threw_half = true;
+    }
+    CHECK(threw_half);
+
+    const auto p_unk = tmp / "unknown.safetensors";
+    write_safetensors(p_unk, {{"mystery_matrix", "F32", {D_IN, D_OUT}, pack_f32(R)}});
+    bool threw_unk = false;
+    try {
+      (void)PlatosKey::load(p_unk, D_IN);
+    } catch (const std::invalid_argument&) {
+      threw_unk = true;
+    }
+    CHECK(threw_unk);
+  }
+
   std::filesystem::remove_all(tmp);
 }
 
@@ -768,6 +1028,7 @@ int main() {
     test_platos_key_fp16_subnormals_0_ulp();
     test_openai_schema_batch_and_base64();
     test_atlas_extensions_and_platos_key_http();
+    test_cartridge_964_binding_and_layouts_fail_closed();
     test_http_400_validation();
     test_mixed_concurrent_chat_and_embeddings_zero_kv_leak();
   } catch (const std::exception& e) {

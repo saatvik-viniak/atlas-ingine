@@ -89,6 +89,7 @@ class ChatServer {
   const bool has_platos_key_;
   const int platos_key_out_dim_;
   const std::string platos_key_tap_spec_;
+  const std::shared_ptr<const PlatosKey> platos_key_;
   const model::Sampling sampling_defaults_;
   const ImageOptions image_options_;
   const std::shared_ptr<const persona::PersonaCatalog> personas_;

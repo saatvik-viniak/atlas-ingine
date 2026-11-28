@@ -3,6 +3,7 @@
 #pragma once
 
 #include "ingine/persona.h"
+#include "ingine/platos_key.h"
 #include "ingine/prefix_cache.h"
 #include "ingine/token_masker.h"
 
@@ -314,6 +315,9 @@ struct EmbeddingRequest {
   std::optional<int> tap_layer;
   // Opt-in in-GPU Plato's Key projection (requires server started with --platos-key).
   bool use_platos_key = false;
+  // Optional #964 cartridge identity pins verified fail-closed against the loaded Plato's Key.
+  std::optional<std::string> cartridge_id;
+  std::optional<std::string> cartridge_sha256;
 };
 
 struct EmbeddingStats {
@@ -403,6 +407,7 @@ class Generator {
   virtual bool has_platos_key() const { return false; }
   virtual int platos_key_out_dim() const { return 0; }
   virtual std::string platos_key_tap_spec() const { return {}; }
+  virtual std::shared_ptr<const PlatosKey> platos_key() const { return nullptr; }
   virtual EmbeddingResult embed(const EmbeddingRequest& /*req*/) {
     throw std::runtime_error("embeddings are not supported by this generator backend");
   }

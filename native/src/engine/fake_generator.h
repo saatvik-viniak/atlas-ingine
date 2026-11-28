@@ -99,6 +99,7 @@ class FakeGenerator final : public model::Generator {
   bool has_platos_key() const override { return platos_key_ != nullptr; }
   int platos_key_out_dim() const override { return platos_key_ ? platos_key_->out_dim() : 0; }
   std::string platos_key_tap_spec() const override { return platos_key_ ? platos_key_->metadata().tap_spec : ""; }
+  std::shared_ptr<const PlatosKey> platos_key() const override { return platos_key_; }
   model::EmbeddingResult embed(const model::EmbeddingRequest& req) override;
 
   void set_supports_embeddings(bool enabled) { supports_embeddings_ = enabled; }

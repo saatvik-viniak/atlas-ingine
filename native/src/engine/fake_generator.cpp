@@ -391,9 +391,8 @@ std::vector<FakeGenerator::Call> FakeGenerator::warm_start_calls() const {
 }
 
 void FakeGenerator::set_platos_key(std::shared_ptr<const PlatosKey> key) {
-  if (key && embedding_dim_ > 0 && key->in_dim() != embedding_dim_) {
-    throw std::invalid_argument("FakeGenerator: platos_key d_in (" + std::to_string(key->in_dim()) +
-                                ") does not match embedding_dim (" + std::to_string(embedding_dim_) + ")");
+  if (key) {
+    key->validate_binding(model_id_, model_family_, embedding_dim_, num_tap_layers_);
   }
   std::lock_guard lock(mutex_);
   platos_key_ = std::move(key);
@@ -428,6 +427,10 @@ model::EmbeddingResult FakeGenerator::embed(const model::EmbeddingRequest& req) 
   }
   if (req.use_platos_key && !pk) {
     throw std::invalid_argument("embed: platos_key requested but no --platos-key is loaded");
+  }
+  if (req.use_platos_key) {
+    pk->validate_request_tap(req.tap_layer);
+    pk->validate_request_identity(req.cartridge_id.value_or(""), req.cartridge_sha256.value_or(""));
   }
 
   const auto t0 = std::chrono::steady_clock::now();

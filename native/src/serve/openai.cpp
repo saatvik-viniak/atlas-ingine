@@ -616,6 +616,15 @@ std::string dump(const Json& value) { return value.dump(-1, ' ', false, Json::er
 
 ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
                                                int num_tap_layers, bool has_platos_key) {
+  ParsedEmbeddingRequest out = parse_embedding_request(body, fmt, max_model_len, num_tap_layers, nullptr);
+  if (out.request.use_platos_key && !has_platos_key) {
+    throw BadRequest("'platos_key' requested but server was started without --platos-key", "platos_key");
+  }
+  return out;
+}
+
+ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
+                                               int num_tap_layers, const PlatosKey* loaded_platos_key) {
   ParsedEmbeddingRequest out;
 
   if (const Json* m = get(body, "model")) {
@@ -698,11 +707,44 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
     out.request.tap_layer = static_cast<int>(*tap);
   }
 
+  if (const Json* cid = get(body, "cartridge_id")) {
+    if (!cid->is_string() || cid->get_ref<const std::string&>().empty()) {
+      throw BadRequest("'cartridge_id' must be a non-empty string", "cartridge_id");
+    }
+    out.request.cartridge_id = cid->get<std::string>();
+  }
+
+  if (const Json* csha = get(body, "cartridge_sha256")) {
+    if (!csha->is_string() || csha->get_ref<const std::string&>().empty()) {
+      throw BadRequest("'cartridge_sha256' must be a non-empty string", "cartridge_sha256");
+    }
+    out.request.cartridge_sha256 = csha->get<std::string>();
+  }
+
   if (const Json* pk = get(body, "platos_key")) {
     if (!pk->is_boolean()) throw BadRequest("'platos_key' must be a boolean", "platos_key");
     out.request.use_platos_key = pk->get<bool>();
-    if (out.request.use_platos_key && !has_platos_key) {
-      throw BadRequest("'platos_key' requested but server was started without --platos-key", "platos_key");
+  }
+
+  if (!out.request.use_platos_key &&
+      (out.request.cartridge_id.has_value() || out.request.cartridge_sha256.has_value())) {
+    throw BadRequest("'cartridge_id'/'cartridge_sha256' require 'platos_key': true",
+                     out.request.cartridge_sha256.has_value() ? "cartridge_sha256" : "cartridge_id");
+  }
+
+  if (out.request.use_platos_key && loaded_platos_key != nullptr) {
+    try {
+      loaded_platos_key->validate_request_tap(out.request.tap_layer);
+    } catch (const std::invalid_argument& e) {
+      throw BadRequest(e.what(), "tap_layer");
+    }
+    try {
+      loaded_platos_key->validate_request_identity(out.request.cartridge_id.value_or(""),
+                                                   out.request.cartridge_sha256.value_or(""));
+    } catch (const std::invalid_argument& e) {
+      const std::string_view msg(e.what());
+      const char* param = (msg.find("cartridge_id") != std::string_view::npos) ? "cartridge_id" : "cartridge_sha256";
+      throw BadRequest(e.what(), param);
     }
   }
 

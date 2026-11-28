@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -24,13 +25,21 @@
 namespace ingine {
 
 struct PlatosKeyMetadata {
-  std::string format;          // e.g. "platos_key_v1" or "affine_wb"
+  std::string format;          // e.g. "platos_key_v1", "platos_key_v2", "platos_key_svd_v1", "affine_wb", "omni946-inkling-yue2-key/v1"
+  std::string tensor_layout;   // "ridge_R", "svd_Ur_Vr", "affine_W_yue2", or "affine_W"
   std::string schema_version;  // optional schema_version string
-  std::string donor_model;     // optional donor_model / source_model
+  std::string cartridge_id;    // optional #964 cartridge_id
+  std::string file_sha256;     // lowercase 64-hex SHA-256 computed over exact loaded safetensors bytes
+  std::string donor_model;     // optional donor_model_id / donor_model / source_model
   std::string target_model;    // optional target_model
   std::string tap_spec;        // optional tap_spec (e.g. "layer_31", "visit_23", "final_normed")
   std::string method;          // optional solver/method (e.g. "ridge", "ridge_norm", "procrustes_var_match")
-  std::string weight_dtype;    // safetensors dtype of R/W ("F16", "BF16", "F32")
+  std::string weight_dtype;    // safetensors dtype of primary projection tensor ("F16", "BF16", "F32")
+  std::optional<int> expected_tap_layer;  // bound single-tap index from sidecar tap_layer or layer_N/visit_N tap_spec
+  bool requires_final_layer = false;      // true when tap_spec binds "final_normed" / "final"
+  bool is_multi_tap = false;              // true when tap_spec declares multi-tap concat (rejected on single-tap servers)
+  bool forbidden_coord_d2027_zero_masked = false;  // Inkling-2-Mini: zero x[2027] before centering/projection
+  int svd_rank = 0;                       // > 0 for factorized svd_Ur_Vr keys
   int d_in = 0;
   int d_out = 0;
   float scale = 1.0f;
@@ -77,6 +86,13 @@ class PlatosKey {
   // Projects `in_x` [batch, d_in] -> `out_y` [batch, d_out] on CPU with FP64 dot accumulation.
   // `in_x` and `out_y` may alias only if d_in == d_out (handled via internal staging when aliased).
   void project_cpu(const float* in_x, int batch, float* out_y, bool l2_normalize = false) const;
+
+  // Fail-closed runtime binding checks (startup donor/dim/tap-range/layout check + per-request tap/cartridge checks).
+  void validate_binding(std::string_view active_model_id, std::string_view active_model_family,
+                        int active_embedding_dim, int active_num_tap_layers) const;
+  void validate_request_tap(std::optional<int> requested_tap_layer) const;
+  void validate_request_identity(std::string_view requested_cartridge_id,
+                                 std::string_view requested_cartridge_sha256) const;
 
  private:
   PlatosKey() = default;

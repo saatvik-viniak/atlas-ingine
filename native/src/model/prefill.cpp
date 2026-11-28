@@ -1139,6 +1139,10 @@ EmbeddingResult Prefiller::embed(const EmbeddingRequest& req, int max_ctx, const
   if (req.use_platos_key && !platos_key) {
     throw std::invalid_argument("embed: platos_key requested but server was started without --platos-key");
   }
+  if (req.use_platos_key) {
+    platos_key->key()->validate_request_tap(req.tap_layer);
+    platos_key->key()->validate_request_identity(req.cartridge_id.value_or(""), req.cartridge_sha256.value_or(""));
+  }
   const int total_seqs = static_cast<int>(req.inputs.size());
   int total_tokens = 0;
   for (int i = 0; i < total_seqs; ++i) {

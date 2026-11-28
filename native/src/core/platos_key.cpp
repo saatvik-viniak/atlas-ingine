@@ -1,45 +1,177 @@
 #include "ingine/platos_key.h"
 
 #include "core/act.h"
-#include "core/safetensors.h"
+#include "core/sha256.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 namespace ingine {
 namespace {
 
-std::vector<float> decode_tensor_f32(const SafetensorsFile& file, const SafetensorsTensor& t) {
-  const std::vector<std::byte> raw = file.read(t.name);
+struct RawTensorDesc {
+  std::string name;
+  std::string dtype;
+  std::vector<std::int64_t> shape;
+  std::uint64_t data_begin = 0;  // absolute byte offset in raw_file
+  std::uint64_t data_end = 0;
+
+  std::int64_t numel() const noexcept {
+    std::int64_t n = 1;
+    for (std::int64_t d : shape) n *= d;
+    return n;
+  }
+};
+
+struct ParsedSafetensorsBuffer {
+  std::vector<std::uint8_t> bytes;
+  std::string sha256;
+  std::map<std::string, std::string> metadata;
+  std::unordered_map<std::string, RawTensorDesc> tensors;
+
+  const RawTensorDesc* find(std::string_view name) const noexcept {
+    const auto it = tensors.find(std::string(name));
+    return it == tensors.end() ? nullptr : &it->second;
+  }
+};
+
+std::string to_lower_ascii(std::string_view s) {
+  std::string out(s);
+  for (char& ch : out) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return out;
+}
+
+std::string normalize_sha256_hex_strict(std::string_view hex, const char* field_name) {
+  if (hex.size() != 64) {
+    throw std::invalid_argument(std::string("platos_key: '") + field_name + "' must be a 64-char hex SHA-256");
+  }
+  std::string lower(64, '0');
+  for (std::size_t i = 0; i < 64; ++i) {
+    const unsigned char c = static_cast<unsigned char>(hex[i]);
+    if (c >= '0' && c <= '9') {
+      lower[i] = static_cast<char>(c);
+    } else if (c >= 'a' && c <= 'f') {
+      lower[i] = static_cast<char>(c);
+    } else if (c >= 'A' && c <= 'F') {
+      lower[i] = static_cast<char>(c - 'A' + 'a');
+    } else {
+      throw std::invalid_argument(std::string("platos_key: invalid hex char in '") + field_name + "'");
+    }
+  }
+  return lower;
+}
+
+// Single-read zero-TOCTOU load of a safetensors file + exact SHA-256 over the consumed bytes.
+ParsedSafetensorsBuffer read_and_parse_safetensors_once(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  if (!in) throw std::invalid_argument("platos_key: cannot open '" + path.string() + "'");
+  const std::streamoff sz = in.tellg();
+  if (sz < 8) throw std::invalid_argument("platos_key: file truncated (<8 bytes): " + path.string());
+  in.seekg(0, std::ios::beg);
+
+  ParsedSafetensorsBuffer out;
+  out.bytes.resize(static_cast<std::size_t>(sz));
+  in.read(reinterpret_cast<char*>(out.bytes.data()), sz);
+  if (!in) throw std::invalid_argument("platos_key: read error on '" + path.string() + "'");
+
+  out.sha256 = sha256_hex(sha256_bytes(out.bytes.data(), out.bytes.size()));
+
+  std::uint64_t hdr_len = 0;
+  for (int i = 0; i < 8; ++i) hdr_len |= static_cast<std::uint64_t>(out.bytes[static_cast<std::size_t>(i)]) << (8 * i);
+  if (hdr_len == 0 || hdr_len > out.bytes.size() - 8) {
+    throw std::invalid_argument("platos_key: invalid safetensors header length in '" + path.string() + "'");
+  }
+  const std::uint64_t data_base = 8 + hdr_len;
+  const std::uint64_t data_len = static_cast<std::uint64_t>(out.bytes.size()) - data_base;
+
+  nlohmann::json hdr;
+  try {
+    hdr = nlohmann::json::parse(out.bytes.data() + 8, out.bytes.data() + data_base);
+  } catch (const nlohmann::json::exception& e) {
+    throw std::invalid_argument("platos_key: malformed safetensors JSON header in '" + path.string() + "': " + e.what());
+  }
+  if (!hdr.is_object()) {
+    throw std::invalid_argument("platos_key: safetensors header root must be an object in '" + path.string() + "'");
+  }
+  for (const auto& [k, v] : hdr.items()) {
+    if (k == "__metadata__") {
+      if (v.is_object()) {
+        for (const auto& [mk, mv] : v.items()) {
+          if (mv.is_string()) out.metadata[mk] = mv.get<std::string>();
+        }
+      }
+      continue;
+    }
+    if (!v.is_object() || !v.contains("dtype") || !v.contains("shape") || !v.contains("data_offsets")) {
+      throw std::invalid_argument("platos_key: malformed tensor descriptor '" + k + "'");
+    }
+    RawTensorDesc td;
+    td.name = k;
+    td.dtype = v["dtype"].get<std::string>();
+    const auto& sh = v["shape"];
+    if (!sh.is_array()) throw std::invalid_argument("platos_key: shape must be array for '" + k + "'");
+    for (const auto& d : sh) {
+      const std::int64_t dv = d.get<std::int64_t>();
+      if (dv < 0) throw std::invalid_argument("platos_key: negative dim in shape for '" + k + "'");
+      td.shape.push_back(dv);
+    }
+    const auto& offs = v["data_offsets"];
+    if (!offs.is_array() || offs.size() != 2) {
+      throw std::invalid_argument("platos_key: invalid data_offsets for '" + k + "'");
+    }
+    const std::uint64_t b = offs[0].get<std::uint64_t>();
+    const std::uint64_t e = offs[1].get<std::uint64_t>();
+    if (e < b || e > data_len) {
+      throw std::invalid_argument("platos_key: out-of-bounds data_offsets for '" + k + "'");
+    }
+    td.data_begin = data_base + b;
+    td.data_end = data_base + e;
+    out.tensors.emplace(k, std::move(td));
+  }
+  return out;
+}
+
+std::vector<float> decode_tensor_f32(const ParsedSafetensorsBuffer& buf, const RawTensorDesc& t) {
+  const std::uint8_t* raw = buf.bytes.data() + t.data_begin;
+  const std::size_t raw_size = static_cast<std::size_t>(t.data_end - t.data_begin);
   const std::size_t n = static_cast<std::size_t>(t.numel());
   std::vector<float> out(n);
   if (t.dtype == "F32") {
-    if (raw.size() != n * 4) throw std::invalid_argument("platos_key: F32 byte size mismatch for " + t.name);
-    std::memcpy(out.data(), raw.data(), raw.size());
+    if (raw_size != n * 4) throw std::invalid_argument("platos_key: F32 byte size mismatch for " + t.name);
+    std::memcpy(out.data(), raw, raw_size);
+  } else if (t.dtype == "F64") {
+    if (raw_size != n * 8) throw std::invalid_argument("platos_key: F64 byte size mismatch for " + t.name);
+    for (std::size_t i = 0; i < n; ++i) {
+      double dv = 0.0;
+      std::memcpy(&dv, raw + i * 8, 8);
+      out[i] = static_cast<float>(dv);
+    }
   } else if (t.dtype == "F16") {
-    if (raw.size() != n * 2) throw std::invalid_argument("platos_key: F16 byte size mismatch for " + t.name);
+    if (raw_size != n * 2) throw std::invalid_argument("platos_key: F16 byte size mismatch for " + t.name);
     for (std::size_t i = 0; i < n; ++i) {
       std::uint16_t bits = 0;
-      std::memcpy(&bits, raw.data() + i * 2, 2);
+      std::memcpy(&bits, raw + i * 2, 2);
       out[i] = act::host_fp16_bits_to_float(bits);
     }
   } else if (t.dtype == "BF16") {
-    if (raw.size() != n * 2) throw std::invalid_argument("platos_key: BF16 byte size mismatch for " + t.name);
+    if (raw_size != n * 2) throw std::invalid_argument("platos_key: BF16 byte size mismatch for " + t.name);
     for (std::size_t i = 0; i < n; ++i) {
       std::uint16_t bits = 0;
-      std::memcpy(&bits, raw.data() + i * 2, 2);
+      std::memcpy(&bits, raw + i * 2, 2);
       out[i] = act::host_bf16_bits_to_float(bits);
     }
   } else {
     throw std::invalid_argument("platos_key: unsupported tensor dtype '" + t.dtype + "' for '" + t.name +
-                                "' (expected F16, BF16, or F32)");
+                                "' (expected F16, BF16, F32, or F64)");
   }
   for (std::size_t i = 0; i < n; ++i) {
     if (!std::isfinite(out[i])) {
@@ -65,8 +197,99 @@ std::string meta_get_first(const std::map<std::string, std::string>& m, std::ini
   return {};
 }
 
-void merge_and_validate_json_metadata(std::string_view json_text, PlatosKeyMetadata& meta) {
-  if (json_text.empty()) return;
+std::optional<int> parse_strict_nonneg_int(std::string_view s) noexcept {
+  if (s.empty()) return std::nullopt;
+  int v = 0;
+  for (char c : s) {
+    if (c < '0' || c > '9') return std::nullopt;
+    if (v > 1000000) return std::nullopt;
+    v = v * 10 + (c - '0');
+  }
+  return v;
+}
+
+// Parses unambiguous single-tap specs ("layer_31", "visit_41") and classifies final/multi-tap specs.
+void parse_and_validate_tap_binding(PlatosKeyMetadata& meta, std::optional<int> explicit_tap_layer) {
+  const std::string spec_l = to_lower_ascii(meta.tap_spec);
+  std::optional<int> spec_tap;
+  if (spec_l == "final_normed" || spec_l == "final") {
+    meta.requires_final_layer = true;
+  } else if (spec_l.find("concat") != std::string::npos) {
+    meta.is_multi_tap = true;
+  } else if (spec_l.rfind("layer_", 0) == 0) {
+    spec_tap = parse_strict_nonneg_int(std::string_view(spec_l).substr(6));
+    if (!spec_tap.has_value()) {
+      throw std::invalid_argument("platos_key: malformed tap_spec '" + meta.tap_spec + "'");
+    }
+  } else if (spec_l.rfind("visit_", 0) == 0) {
+    spec_tap = parse_strict_nonneg_int(std::string_view(spec_l).substr(6));
+    if (!spec_tap.has_value()) {
+      throw std::invalid_argument("platos_key: malformed tap_spec '" + meta.tap_spec + "'");
+    }
+  }
+
+  if (explicit_tap_layer.has_value()) {
+    if (*explicit_tap_layer < 0) {
+      throw std::invalid_argument("platos_key: negative tap_layer " + std::to_string(*explicit_tap_layer));
+    }
+    if (meta.requires_final_layer) {
+      throw std::invalid_argument("platos_key: metadata tap_layer=" + std::to_string(*explicit_tap_layer) +
+                                  " conflicts with tap_spec='" + meta.tap_spec + "'");
+    }
+    if (meta.is_multi_tap) {
+      throw std::invalid_argument("platos_key: metadata tap_layer=" + std::to_string(*explicit_tap_layer) +
+                                  " conflicts with multi-tap tap_spec='" + meta.tap_spec + "'");
+    }
+    if (spec_tap.has_value() && *spec_tap != *explicit_tap_layer) {
+      throw std::invalid_argument("platos_key: metadata tap_layer=" + std::to_string(*explicit_tap_layer) +
+                                  " conflicts with tap_spec='" + meta.tap_spec + "'");
+    }
+    meta.expected_tap_layer = *explicit_tap_layer;
+  } else if (spec_tap.has_value()) {
+    meta.expected_tap_layer = *spec_tap;
+  }
+}
+
+// Canonicalizes a model identifier string to a known family tag when recognizable, else returns empty.
+std::string infer_canonical_family(std::string_view name) {
+  std::string s = to_lower_ascii(name);
+  if (s.find("inkling") != std::string::npos) return "inkling2";
+  if (s.find("qwen3.8") != std::string::npos || s.find("qwen3_8") != std::string::npos ||
+      s.find("qwen38") != std::string::npos || s.find("qwen3.5") != std::string::npos ||
+      s.find("qwen3_5") != std::string::npos || s.find("qwen35") != std::string::npos) {
+    if (s.find("flash-next") != std::string::npos || s.find("flash_next") != std::string::npos) return "qwen4exp";
+    return "qwen3_5";
+  }
+  if (s.find("qwen4exp") != std::string::npos || s.find("qwen4_exp") != std::string::npos) return "qwen4exp";
+  if (s.find("embeddinggemma") != std::string::npos || s.find("embedding_gemma") != std::string::npos) {
+    return "embedding_gemma2";
+  }
+  if (s.find("deepseek") != std::string::npos) return "deepseek_v4";
+  if (s.find("glm") != std::string::npos) return "glm_flash";
+  if (s.find("ling-3") != std::string::npos || s.find("ling_3") != std::string::npos ||
+      s.find("ling32") != std::string::npos) {
+    return "ling32";
+  }
+  return {};
+}
+
+std::string normalize_model_stem(std::string_view name) {
+  std::size_t slash = name.rfind('/');
+  std::string_view tail = (slash == std::string_view::npos) ? name : name.substr(slash + 1);
+  std::string out;
+  out.reserve(tail.size());
+  for (char c : tail) {
+    if (std::isalnum(static_cast<unsigned char>(c))) {
+      out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+  }
+  return out;
+}
+
+std::optional<int> merge_and_validate_json_metadata(std::string_view json_text, PlatosKeyMetadata& meta) {
+  std::optional<int> explicit_tap_layer;
+  if (json_text.empty()) return explicit_tap_layer;
+
   nlohmann::ordered_json obj;
   try {
     obj = nlohmann::ordered_json::parse(json_text);
@@ -78,21 +301,20 @@ void merge_and_validate_json_metadata(std::string_view json_text, PlatosKeyMetad
   }
   meta.json_metadata = std::string(json_text);
 
+  auto parse_json_int = [&](const nlohmann::ordered_json& val, const char* key) -> int {
+    if (val.is_number_integer() && !val.is_boolean()) return val.get<int>();
+    if (val.is_string()) {
+      const auto parsed = parse_strict_nonneg_int(val.get_ref<const std::string&>());
+      if (parsed.has_value()) return *parsed;
+      throw std::invalid_argument(std::string("platos_key: metadata JSON '") + key + "' is not a valid non-negative integer");
+    }
+    throw std::invalid_argument(std::string("platos_key: metadata JSON '") + key + "' must be an integer");
+  };
+
   auto check_dim = [&](const char* key, int actual) {
     auto it = obj.find(key);
     if (it == obj.end() || it->is_null()) return;
-    int declared = -1;
-    if (it->is_number_integer()) {
-      declared = it->get<int>();
-    } else if (it->is_string()) {
-      try {
-        declared = std::stoi(it->get<std::string>());
-      } catch (...) {
-        throw std::invalid_argument(std::string("platos_key: metadata JSON '") + key + "' is not an integer");
-      }
-    } else {
-      throw std::invalid_argument(std::string("platos_key: metadata JSON '") + key + "' must be an integer");
-    }
+    const int declared = parse_json_int(*it, key);
     if (declared != actual) {
       throw std::invalid_argument(std::string("platos_key: metadata JSON '") + key + "'=" + std::to_string(declared) +
                                   " contradicts safetensors shape (" + std::to_string(actual) + ")");
@@ -102,6 +324,31 @@ void merge_and_validate_json_metadata(std::string_view json_text, PlatosKeyMetad
   check_dim("d_in", meta.d_in);
   check_dim("d_target", meta.d_out);
   check_dim("d_out", meta.d_out);
+  if (meta.svd_rank > 0) check_dim("svd_rank", meta.svd_rank);
+
+  // Enforce pinned artifact SHA-256 against the exact loaded safetensors bytes (fail-closed!).
+  for (const char* sha_key : {"cartridge_sha256", "sha256"}) {
+    if (auto it = obj.find(sha_key); it != obj.end() && !it->is_null()) {
+      if (!it->is_string()) {
+        throw std::invalid_argument(std::string("platos_key: metadata JSON '") + sha_key + "' must be a string");
+      }
+      const std::string expected_sha = normalize_sha256_hex_strict(it->get_ref<const std::string&>(), sha_key);
+      if (expected_sha != meta.file_sha256) {
+        throw std::invalid_argument(std::string("platos_key: artifact SHA-256 mismatch for '") + sha_key +
+                                    "': observed=" + meta.file_sha256 + ", expected=" + expected_sha);
+      }
+    }
+  }
+
+  if (auto it = obj.find("tap_layer"); it != obj.end() && !it->is_null()) {
+    explicit_tap_layer = parse_json_int(*it, "tap_layer");
+  }
+  if (auto it = obj.find("forbidden_coord_d2027_zero_masked"); it != obj.end() && !it->is_null()) {
+    if (!it->is_boolean()) {
+      throw std::invalid_argument("platos_key: metadata JSON 'forbidden_coord_d2027_zero_masked' must be a boolean");
+    }
+    meta.forbidden_coord_d2027_zero_masked = it->get<bool>();
+  }
 
   for (const auto& [k, v] : obj.items()) {
     if (v.is_string()) {
@@ -110,6 +357,7 @@ void merge_and_validate_json_metadata(std::string_view json_text, PlatosKeyMetad
       meta.raw_metadata[k] = v.dump();
     }
   }
+  return explicit_tap_layer;
 }
 
 }  // namespace
@@ -151,22 +399,114 @@ std::shared_ptr<const PlatosKey> PlatosKey::load_with_json(const std::filesystem
     throw std::invalid_argument("platos_key: file does not exist: " + safetensors_path.string());
   }
 
-  SafetensorsFile file(safetensors_path);
-  const SafetensorsTensor* mat_t = file.find("R");
-  std::string detected_format = "platos_key_v1";
-  if (!mat_t) {
-    mat_t = file.find("W");
-    detected_format = "affine_wb";
-  }
-  if (!mat_t) {
+  // Single-read load + SHA-256 verification directly on consumed bytes (zero TOCTOU reopen).
+  const ParsedSafetensorsBuffer buf = read_and_parse_safetensors_once(safetensors_path);
+
+  // Explicit fail-closed rejection of negative-space anti-cartridge layouts (#965).
+  if (buf.find("U_bad") != nullptr) {
     throw std::invalid_argument("platos_key: '" + safetensors_path.string() +
-                                "' missing required 2D projection tensor 'R' (or 'W')");
+                                "' is a negative-space anti_cart layout ('U_bad'), unsupported by /v1/embeddings");
   }
-  if (mat_t->shape.size() != 2 || mat_t->shape[0] <= 0 || mat_t->shape[1] <= 0) {
-    throw std::invalid_argument("platos_key: projection tensor '" + mat_t->name + "' must be 2D with positive dims");
+
+  // Supported positive-projection layouts (1:1 contract with #964 AtlasCartridge v1):
+  //   1) ridge_R:       R [d_in, d_out] (+ optional donor_mean, target_mean, scale)
+  //   2) svd_Ur_Vr:     U_r [d_in, r], V_r [r, d_out] (+ optional donor_mean, target_mean, scale)
+  //   3) affine_W_yue2: W_yue2 [d_in, d_out] (+ optional b_yue2)
+  //   4) affine_W:      W [d_in, d_out] (+ optional b)
+  const RawTensorDesc* r_t = buf.find("R");
+  const RawTensorDesc* u_t = buf.find("U_r");
+  const RawTensorDesc* v_t = buf.find("V_r");
+  const RawTensorDesc* wy_t = buf.find("W_yue2");
+  const RawTensorDesc* w_t = buf.find("W");
+
+  std::string detected_format;
+  std::string tensor_layout;
+  std::string primary_dtype;
+  int d_in = 0, d_out = 0, svd_rank = 0;
+  std::vector<float> r_f32;
+  std::vector<std::uint16_t> rt_f16;
+
+  auto populate_rt_f16_from_f32 = [&](const std::vector<float>& mat_f32, int rows, int cols) {
+    rt_f16.resize(static_cast<std::size_t>(cols) * static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+      const float* src_row = mat_f32.data() + static_cast<std::size_t>(i) * static_cast<std::size_t>(cols);
+      for (int j = 0; j < cols; ++j) {
+        rt_f16[static_cast<std::size_t>(j) * static_cast<std::size_t>(rows) + static_cast<std::size_t>(i)] =
+            act::host_float_to_fp16_bits(src_row[j]);
+      }
+    }
+  };
+
+  auto load_2d_direct = [&](const RawTensorDesc& t, std::string_view fmt, std::string_view layout) {
+    if (t.shape.size() != 2 || t.shape[0] <= 0 || t.shape[1] <= 0) {
+      throw std::invalid_argument("platos_key: projection tensor '" + t.name + "' must be 2D with positive dims");
+    }
+    d_in = static_cast<int>(t.shape[0]);
+    d_out = static_cast<int>(t.shape[1]);
+    detected_format = std::string(fmt);
+    tensor_layout = std::string(layout);
+    primary_dtype = t.dtype;
+    r_f32 = decode_tensor_f32(buf, t);
+    if (t.dtype == "F16") {
+      // Preserve exact IEEE-754 binary16 bit patterns (including subnormals) without float roundtrip.
+      const std::uint8_t* raw_r = buf.bytes.data() + t.data_begin;
+      rt_f16.resize(static_cast<std::size_t>(d_out) * static_cast<std::size_t>(d_in));
+      for (int i = 0; i < d_in; ++i) {
+        const std::size_t row_off = static_cast<std::size_t>(i) * static_cast<std::size_t>(d_out);
+        for (int j = 0; j < d_out; ++j) {
+          std::uint16_t bits = 0;
+          std::memcpy(&bits, raw_r + (row_off + static_cast<std::size_t>(j)) * 2, 2);
+          rt_f16[static_cast<std::size_t>(j) * static_cast<std::size_t>(d_in) + static_cast<std::size_t>(i)] = bits;
+        }
+      }
+    } else {
+      populate_rt_f16_from_f32(r_f32, d_in, d_out);
+    }
+  };
+
+  if (r_t) {
+    load_2d_direct(*r_t, "platos_key_v1", "ridge_R");
+  } else if (u_t || v_t) {
+    if (!u_t || !v_t) {
+      throw std::invalid_argument("platos_key: factorized SVD layout requires BOTH 'U_r' and 'V_r' tensors");
+    }
+    if (u_t->shape.size() != 2 || v_t->shape.size() != 2 || u_t->shape[0] <= 0 || u_t->shape[1] <= 0 ||
+        v_t->shape[1] <= 0 || u_t->shape[1] != v_t->shape[0]) {
+      throw std::invalid_argument("platos_key: invalid SVD factor shapes for 'U_r' and 'V_r'");
+    }
+    d_in = static_cast<int>(u_t->shape[0]);
+    svd_rank = static_cast<int>(u_t->shape[1]);
+    d_out = static_cast<int>(v_t->shape[1]);
+    detected_format = "platos_key_svd_v1";
+    tensor_layout = "svd_Ur_Vr";
+    primary_dtype = u_t->dtype;
+    const std::vector<float> u_f32 = decode_tensor_f32(buf, *u_t);
+    const std::vector<float> v_f32 = decode_tensor_f32(buf, *v_t);
+    // Reconstruct dense R = U_r @ V_r in FP64 so CPU & GPU projection paths share identical exact semantics.
+    r_f32.assign(static_cast<std::size_t>(d_in) * static_cast<std::size_t>(d_out), 0.0f);
+    for (int i = 0; i < d_in; ++i) {
+      const float* ui = u_f32.data() + static_cast<std::size_t>(i) * static_cast<std::size_t>(svd_rank);
+      float* ri = r_f32.data() + static_cast<std::size_t>(i) * static_cast<std::size_t>(d_out);
+      for (int j = 0; j < d_out; ++j) {
+        double acc = 0.0;
+        for (int r = 0; r < svd_rank; ++r) {
+          acc += static_cast<double>(ui[r]) *
+                 static_cast<double>(v_f32[static_cast<std::size_t>(r) * static_cast<std::size_t>(d_out) + j]);
+        }
+        ri[j] = static_cast<float>(acc);
+      }
+    }
+    populate_rt_f16_from_f32(r_f32, d_in, d_out);
+  } else if (wy_t) {
+    load_2d_direct(*wy_t, "omni946-inkling-yue2-key/v1", "affine_W_yue2");
+  } else if (w_t) {
+    load_2d_direct(*w_t, "affine_wb", "affine_W");
+  } else {
+    throw std::invalid_argument(
+        "platos_key: '" + safetensors_path.string() +
+        "' has unsupported tensor layout (expected 'R', 'U_r'+'V_r', 'W_yue2', or 'W')");
   }
-  const int d_in = static_cast<int>(mat_t->shape[0]);
-  const int d_out = static_cast<int>(mat_t->shape[1]);
+
   if (expected_in_dim > 0 && d_in != expected_in_dim) {
     throw std::invalid_argument("platos_key: donor dim mismatch in '" + safetensors_path.string() + "' (key d_in=" +
                                 std::to_string(d_in) + ", model hidden_dim=" + std::to_string(expected_in_dim) + ")");
@@ -176,70 +516,163 @@ std::shared_ptr<const PlatosKey> PlatosKey::load_with_json(const std::filesystem
   key->source_path_ = safetensors_path;
   key->meta_.d_in = d_in;
   key->meta_.d_out = d_out;
-  key->meta_.weight_dtype = mat_t->dtype;
-  key->meta_.raw_metadata = file.metadata();
-
-  key->r_f32_ = decode_tensor_f32(file, *mat_t);
-  key->rt_f16_.resize(static_cast<std::size_t>(d_out) * static_cast<std::size_t>(d_in));
-  if (mat_t->dtype == "F16") {
-    // Preserve exact IEEE-754 binary16 bit patterns (including subnormals) without a float roundtrip.
-    const std::vector<std::byte> raw_r = file.read(mat_t->name);
-    for (int i = 0; i < d_in; ++i) {
-      const std::size_t row_off = static_cast<std::size_t>(i) * static_cast<std::size_t>(d_out);
-      for (int j = 0; j < d_out; ++j) {
-        std::uint16_t bits = 0;
-        std::memcpy(&bits, raw_r.data() + (row_off + static_cast<std::size_t>(j)) * 2, 2);
-        key->rt_f16_[static_cast<std::size_t>(j) * static_cast<std::size_t>(d_in) + static_cast<std::size_t>(i)] = bits;
-      }
-    }
-  } else {
-    for (int i = 0; i < d_in; ++i) {
-      const float* src_row = key->r_f32_.data() + static_cast<std::size_t>(i) * static_cast<std::size_t>(d_out);
-      for (int j = 0; j < d_out; ++j) {
-        key->rt_f16_[static_cast<std::size_t>(j) * static_cast<std::size_t>(d_in) + static_cast<std::size_t>(i)] =
-            act::host_float_to_fp16_bits(src_row[j]);
-      }
-    }
-  }
+  key->meta_.svd_rank = svd_rank;
+  key->meta_.tensor_layout = tensor_layout;
+  key->meta_.weight_dtype = primary_dtype;
+  key->meta_.file_sha256 = buf.sha256;
+  key->meta_.raw_metadata = buf.metadata;
+  key->r_f32_ = std::move(r_f32);
+  key->rt_f16_ = std::move(rt_f16);
 
   key->donor_mean_.assign(static_cast<std::size_t>(d_in), 0.0f);
-  if (const SafetensorsTensor* dm = file.find("donor_mean")) {
+  if (const RawTensorDesc* dm = buf.find("donor_mean")) {
     if (dm->shape.size() != 1 || dm->shape[0] != d_in) {
       throw std::invalid_argument("platos_key: 'donor_mean' shape must be [" + std::to_string(d_in) + "]");
     }
-    key->donor_mean_ = decode_tensor_f32(file, *dm);
+    key->donor_mean_ = decode_tensor_f32(buf, *dm);
     key->has_donor_mean_ = true;
   }
 
   key->target_mean_.assign(static_cast<std::size_t>(d_out), 0.0f);
-  const SafetensorsTensor* tm = file.find("target_mean");
-  if (!tm && detected_format == "affine_wb") tm = file.find("b");
+  const RawTensorDesc* tm = buf.find("target_mean");
+  if (!tm && tensor_layout == "affine_W_yue2") tm = buf.find("b_yue2");
+  if (!tm && (tensor_layout == "affine_W" || tensor_layout == "affine_W_yue2")) tm = buf.find("b");
   if (tm) {
     if (tm->shape.size() != 1 || tm->shape[0] != d_out) {
       throw std::invalid_argument("platos_key: '" + tm->name + "' shape must be [" + std::to_string(d_out) + "]");
     }
-    key->target_mean_ = decode_tensor_f32(file, *tm);
+    key->target_mean_ = decode_tensor_f32(buf, *tm);
     key->has_target_mean_ = true;
   }
 
   key->meta_.scale = 1.0f;
-  if (const SafetensorsTensor* sc = file.find("scale")) {
+  if (const RawTensorDesc* sc = buf.find("scale")) {
     if (sc->numel() != 1) {
       throw std::invalid_argument("platos_key: 'scale' tensor must have exactly 1 element");
     }
-    key->meta_.scale = decode_tensor_f32(file, *sc)[0];
+    key->meta_.scale = decode_tensor_f32(buf, *sc)[0];
   }
 
-  merge_and_validate_json_metadata(metadata_json, key->meta_);
+  // Check embedded safetensors metadata SHA-256 if any, then merge & validate external sidecar JSON.
+  const std::optional<int> explicit_tap = merge_and_validate_json_metadata(metadata_json, key->meta_);
 
   key->meta_.format = meta_get_first(key->meta_.raw_metadata, {"format"});
   if (key->meta_.format.empty()) key->meta_.format = detected_format;
   key->meta_.schema_version = meta_get_first(key->meta_.raw_metadata, {"schema_version"});
-  key->meta_.donor_model = meta_get_first(key->meta_.raw_metadata, {"donor_model", "source_model", "model_id"});
+  key->meta_.cartridge_id = meta_get_first(key->meta_.raw_metadata, {"cartridge_id"});
+  key->meta_.donor_model =
+      meta_get_first(key->meta_.raw_metadata, {"donor_model_id", "donor_model", "source_model", "model_id"});
   key->meta_.target_model = meta_get_first(key->meta_.raw_metadata, {"target_model"});
   key->meta_.tap_spec = meta_get_first(key->meta_.raw_metadata, {"tap_spec", "target_tap"});
   key->meta_.method = meta_get_first(key->meta_.raw_metadata, {"method", "solver"});
+
+  // Also honor forbidden_coord_d2027_zero_masked if declared in embedded safetensors metadata or deployment_spec.
+  if (!key->meta_.forbidden_coord_d2027_zero_masked) {
+    const std::string raw_mask = to_lower_ascii(
+        meta_get_first(key->meta_.raw_metadata, {"forbidden_coord_d2027_zero_masked"}));
+    if (raw_mask == "true" || raw_mask == "1") {
+      key->meta_.forbidden_coord_d2027_zero_masked = true;
+    } else if (const std::string ds = meta_get_first(key->meta_.raw_metadata, {"deployment_spec"}); !ds.empty()) {
+      try {
+        const auto ds_json = nlohmann::json::parse(ds);
+        if (ds_json.is_object() && ds_json.contains("forbidden_coord_d2027_zero_masked") &&
+            ds_json["forbidden_coord_d2027_zero_masked"].is_boolean() &&
+            ds_json["forbidden_coord_d2027_zero_masked"].get<bool>()) {
+          key->meta_.forbidden_coord_d2027_zero_masked = true;
+        }
+      } catch (...) {
+      }
+    }
+  }
+
+  // If tap_layer wasn't in sidecar JSON, check embedded raw_metadata["tap_layer"].
+  std::optional<int> tap_from_meta = explicit_tap;
+  if (!tap_from_meta.has_value()) {
+    if (const std::string raw_tl = meta_get_first(key->meta_.raw_metadata, {"tap_layer"});
+        !raw_tl.empty() && to_lower_ascii(raw_tl) != "none" && to_lower_ascii(raw_tl) != "null") {
+      tap_from_meta = parse_strict_nonneg_int(raw_tl);
+      if (!tap_from_meta.has_value()) {
+        throw std::invalid_argument("platos_key: malformed metadata tap_layer '" + raw_tl + "'");
+      }
+    }
+  }
+  parse_and_validate_tap_binding(key->meta_, tap_from_meta);
   return key;
+}
+
+void PlatosKey::validate_binding(std::string_view active_model_id, std::string_view active_model_family,
+                                 int active_embedding_dim, int active_num_tap_layers) const {
+  if (meta_.is_multi_tap) {
+    throw std::invalid_argument("platos_key: multi-tap concat spec '" + meta_.tap_spec +
+                                "' is not supported by single-tap /v1/embeddings");
+  }
+  if (active_embedding_dim > 0 && meta_.d_in != active_embedding_dim) {
+    throw std::invalid_argument("platos_key: donor dim mismatch (key d_in=" + std::to_string(meta_.d_in) +
+                                ", active model embedding_dim=" + std::to_string(active_embedding_dim) + ")");
+  }
+  if (meta_.expected_tap_layer.has_value() && active_num_tap_layers > 0) {
+    if (*meta_.expected_tap_layer < 0 || *meta_.expected_tap_layer >= active_num_tap_layers) {
+      throw std::invalid_argument("platos_key: bound tap_layer=" + std::to_string(*meta_.expected_tap_layer) +
+                                  " out of active model range [0, " + std::to_string(active_num_tap_layers - 1) + "]");
+    }
+  }
+  if (!meta_.donor_model.empty()) {
+    const std::string donor_fam = infer_canonical_family(meta_.donor_model);
+    std::string active_fam = infer_canonical_family(active_model_family);
+    if (active_fam.empty()) active_fam = infer_canonical_family(active_model_id);
+    if (!donor_fam.empty() || !active_fam.empty()) {
+      if (donor_fam != active_fam) {
+        throw std::invalid_argument("platos_key: donor_model mismatch (key binds '" + meta_.donor_model +
+                                    "', active runtime is model='" + std::string(active_model_id) + "' family='" +
+                                    std::string(active_model_family) + "')");
+      }
+    } else {
+      if (normalize_model_stem(meta_.donor_model) != normalize_model_stem(active_model_id)) {
+        throw std::invalid_argument("platos_key: donor_model mismatch (key binds '" + meta_.donor_model +
+                                    "', active runtime is '" + std::string(active_model_id) + "')");
+      }
+    }
+  }
+}
+
+void PlatosKey::validate_request_tap(std::optional<int> requested_tap_layer) const {
+  if (meta_.is_multi_tap) {
+    throw std::invalid_argument("platos_key: multi-tap concat spec '" + meta_.tap_spec +
+                                "' cannot be executed by single-tap /v1/embeddings");
+  }
+  if (meta_.expected_tap_layer.has_value()) {
+    if (!requested_tap_layer.has_value()) {
+      throw std::invalid_argument("platos_key is bound to tap_layer=" + std::to_string(*meta_.expected_tap_layer) +
+                                  " (tap_spec='" + meta_.tap_spec + "'); request must specify tap_layer=" +
+                                  std::to_string(*meta_.expected_tap_layer));
+    }
+    if (*requested_tap_layer != *meta_.expected_tap_layer) {
+      throw std::invalid_argument("requested tap_layer=" + std::to_string(*requested_tap_layer) +
+                                  " conflicts with loaded platos_key bound to tap_layer=" +
+                                  std::to_string(*meta_.expected_tap_layer));
+    }
+  } else if (meta_.requires_final_layer && requested_tap_layer.has_value()) {
+    throw std::invalid_argument("requested tap_layer=" + std::to_string(*requested_tap_layer) +
+                                " conflicts with loaded platos_key bound to final layer (tap_spec='" + meta_.tap_spec +
+                                "')");
+  }
+}
+
+void PlatosKey::validate_request_identity(std::string_view requested_cartridge_id,
+                                          std::string_view requested_cartridge_sha256) const {
+  if (!requested_cartridge_sha256.empty()) {
+    const std::string req_sha = normalize_sha256_hex_strict(requested_cartridge_sha256, "cartridge_sha256");
+    if (req_sha != meta_.file_sha256) {
+      throw std::invalid_argument("requested cartridge_sha256=" + req_sha +
+                                  " does not match loaded platos_key sha256=" + meta_.file_sha256);
+    }
+  }
+  if (!requested_cartridge_id.empty()) {
+    if (meta_.cartridge_id.empty() || requested_cartridge_id != meta_.cartridge_id) {
+      throw std::invalid_argument("requested cartridge_id='" + std::string(requested_cartridge_id) +
+                                  "' does not match loaded platos_key cartridge_id='" + meta_.cartridge_id + "'");
+    }
+  }
 }
 
 void PlatosKey::project_cpu(const float* in_x, int batch, float* out_y, bool l2_normalize) const {
@@ -256,13 +689,14 @@ void PlatosKey::project_cpu(const float* in_x, int batch, float* out_y, bool l2_
     x_src = staged.data();
   }
 
+  const int mask_coord = meta_.forbidden_coord_d2027_zero_masked ? 2027 : -1;
   std::vector<double> centered(static_cast<std::size_t>(d_in));
   for (int b = 0; b < batch; ++b) {
     const float* x_row = x_src + static_cast<std::size_t>(b) * static_cast<std::size_t>(d_in);
     float* y_row = out_y + static_cast<std::size_t>(b) * static_cast<std::size_t>(d_out);
     for (int i = 0; i < d_in; ++i) {
-      centered[static_cast<std::size_t>(i)] =
-          static_cast<double>(x_row[i]) - static_cast<double>(donor_mean_[static_cast<std::size_t>(i)]);
+      const double xv = (i == mask_coord) ? 0.0 : static_cast<double>(x_row[i]);
+      centered[static_cast<std::size_t>(i)] = xv - static_cast<double>(donor_mean_[static_cast<std::size_t>(i)]);
     }
     for (int j = 0; j < d_out; ++j) {
       double acc = 0.0;

@@ -131,6 +131,7 @@ class Qwen38DenseBackend final : public ingine::model::ModelBackend {
   bool has_platos_key() const override;
   int platos_key_out_dim() const override;
   std::string platos_key_tap_spec() const override;
+  std::shared_ptr<const PlatosKey> platos_key() const override;
   ingine::model::EmbeddingResult embed(const ingine::model::EmbeddingRequest& req) override;
 
   // ingine::model::ModelBackend

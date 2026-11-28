@@ -155,6 +155,9 @@ class EngineGenerator final : public Generator {
   std::string platos_key_tap_spec() const override {
     return platos_key_gpu_ ? platos_key_gpu_->metadata().tap_spec : "";
   }
+  std::shared_ptr<const PlatosKey> platos_key() const override {
+    return platos_key_gpu_ ? platos_key_gpu_->key() : nullptr;
+  }
   EmbeddingResult embed(const EmbeddingRequest& req) override {
     std::lock_guard<std::mutex> lock(mutex_);
     // Stateless zero-KV embedding prefill: never reads or writes rt_.state(), checkpoint_, or parked_.
@@ -273,6 +276,7 @@ class EngineGenerator final : public Generator {
     if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, rt_.stream());
     if (!options_.platos_key.empty()) {
       platos_key_gpu_ = PlatosKeyGpu::load(options_.platos_key, options_.platos_key_metadata, HIDDEN, rt_.stream());
+      platos_key_gpu_->key()->validate_binding(model_id(), model_family(), HIDDEN, prefiller_.num_visits());
     }
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
 

@@ -1448,6 +1448,7 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
   if (!options.platos_key.empty()) {
     impl_->platos_key_gpu =
         ingine::PlatosKeyGpu::load(options.platos_key, options.platos_key_metadata, c.hidden_size, impl_->ctx.stream);
+    impl_->platos_key_gpu->key()->validate_binding(model_id(), model_family(), c.hidden_size, c.num_hidden_layers);
   }
 
   std::size_t vram_free_after = 0;
@@ -2034,6 +2035,10 @@ std::string Qwen38DenseBackend::platos_key_tap_spec() const {
   return impl_->platos_key_gpu ? impl_->platos_key_gpu->metadata().tap_spec : "";
 }
 
+std::shared_ptr<const PlatosKey> Qwen38DenseBackend::platos_key() const {
+  return impl_->platos_key_gpu ? impl_->platos_key_gpu->key() : nullptr;
+}
+
 ingine::model::EmbeddingResult Qwen38DenseBackend::embed(const ingine::model::EmbeddingRequest& req) {
   impl_->ctx.bind_to_current_thread();
   const auto& c = impl_->manifest.config;
@@ -2050,6 +2055,11 @@ ingine::model::EmbeddingResult Qwen38DenseBackend::embed(const ingine::model::Em
   }
   if (req.use_platos_key && !impl_->platos_key_gpu) {
     throw std::invalid_argument("embed: platos_key requested but server was started without --platos-key");
+  }
+  if (req.use_platos_key) {
+    impl_->platos_key_gpu->key()->validate_request_tap(req.tap_layer);
+    impl_->platos_key_gpu->key()->validate_request_identity(req.cartridge_id.value_or(""),
+                                                           req.cartridge_sha256.value_or(""));
   }
 
   const int total_seqs = static_cast<int>(req.inputs.size());

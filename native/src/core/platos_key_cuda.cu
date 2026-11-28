@@ -136,7 +136,8 @@ template <int MAX_B>
 __global__ void __launch_bounds__(256)
     platos_project_small_batch_f16_kernel(const float* __restrict__ x, const float* __restrict__ donor_mean,
                                           const __half* __restrict__ rt_f16, const float* __restrict__ target_mean,
-                                          float scale, int batch, int d_in, int d_out, float* __restrict__ out) {
+                                          float scale, int batch, int d_in, int d_out, int mask_coord,
+                                          float* __restrict__ out) {
   const int warp_in_block = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int j = static_cast<int>(blockIdx.x) * 8 + warp_in_block;
@@ -162,20 +163,20 @@ __global__ void __launch_bounds__(256)
       const float4 dm0 = *reinterpret_cast<const float4*>(donor_mean + i);
       const float4 dm1 = *reinterpret_cast<const float4*>(donor_mean + i + 4);
       const float dm[8] = {dm0.x, dm0.y, dm0.z, dm0.w, dm1.x, dm1.y, dm1.z, dm1.w};
+      const bool has_mask = (mask_coord >= i && mask_coord < i + 8);
+      const int mask_lane = has_mask ? (mask_coord - i) : -1;
 
       for (int b = 0; b < batch; ++b) {
         const float* xb = x + static_cast<std::size_t>(b) * static_cast<std::size_t>(d_in) + i;
         const float4 x0 = *reinterpret_cast<const float4*>(xb);
         const float4 x1 = *reinterpret_cast<const float4*>(xb + 4);
+        float xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+        if (has_mask) xv[mask_lane] = 0.0f;
         float s = acc[b];
-        s = fmaf(x0.x - dm[0], wv[0], s);
-        s = fmaf(x0.y - dm[1], wv[1], s);
-        s = fmaf(x0.z - dm[2], wv[2], s);
-        s = fmaf(x0.w - dm[3], wv[3], s);
-        s = fmaf(x1.x - dm[4], wv[4], s);
-        s = fmaf(x1.y - dm[5], wv[5], s);
-        s = fmaf(x1.z - dm[6], wv[6], s);
-        s = fmaf(x1.w - dm[7], wv[7], s);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          s = fmaf(xv[k] - dm[k], wv[k], s);
+        }
         acc[b] = s;
       }
     }
@@ -184,7 +185,7 @@ __global__ void __launch_bounds__(256)
       const float wv = __half2float(w_row[i]);
       const float dmv = donor_mean[i];
       for (int b = 0; b < batch; ++b) {
-        const float xv = x[static_cast<std::size_t>(b) * static_cast<std::size_t>(d_in) + i];
+        const float xv = (i == mask_coord) ? 0.0f : x[static_cast<std::size_t>(b) * static_cast<std::size_t>(d_in) + i];
         acc[b] = fmaf(xv - dmv, wv, acc[b]);
       }
     }
@@ -200,12 +201,13 @@ __global__ void __launch_bounds__(256)
 }
 
 __global__ void center_to_f16_kernel(const float* __restrict__ x, const float* __restrict__ donor_mean, int batch,
-                                     int d_in, __half* __restrict__ out_f16) {
+                                     int d_in, int mask_coord, __half* __restrict__ out_f16) {
   const std::size_t total = static_cast<std::size_t>(batch) * static_cast<std::size_t>(d_in);
   const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= total) return;
   const int col = static_cast<int>(idx % static_cast<std::size_t>(d_in));
-  out_f16[idx] = __float2half_rn(x[idx] - donor_mean[col]);
+  const float xv = (col == mask_coord) ? 0.0f : x[idx];
+  out_f16[idx] = __float2half_rn(xv - donor_mean[col]);
 }
 
 __global__ void scale_add_target_mean_kernel(float* __restrict__ y, const float* __restrict__ target_mean, float scale,
@@ -222,6 +224,7 @@ __global__ void scale_add_target_mean_kernel(float* __restrict__ y, const float*
 struct PlatosKeyGpu::Impl {
   int d_in = 0;
   int d_out = 0;
+  int mask_coord = -1;
   float scale = 1.0f;
   __half* d_rt_f16 = nullptr;      // [d_out, d_in] FP16
   float* d_donor_mean = nullptr;   // [d_in] FP32
@@ -271,6 +274,7 @@ std::shared_ptr<const PlatosKeyGpu> PlatosKeyGpu::create(std::shared_ptr<const P
   auto impl = std::make_unique<Impl>();
   impl->d_in = key->in_dim();
   impl->d_out = key->out_dim();
+  impl->mask_coord = key->metadata().forbidden_coord_d2027_zero_masked ? 2027 : -1;
   impl->scale = key->scale();
 
   const std::size_t rt_bytes = key->weights_f16_transposed().size() * sizeof(__half);
@@ -319,15 +323,15 @@ void PlatosKeyGpu::project(const float* d_in_x, int batch, float* d_out_y, bool 
     if (batch == 1) {
       platos_project_small_batch_f16_kernel<1><<<blocks, 256, 0, stream>>>(
           d_in_x, impl_->d_donor_mean, impl_->d_rt_f16, impl_->d_target_mean, impl_->scale, batch, d_in, d_out,
-          d_out_y);
+          impl_->mask_coord, d_out_y);
     } else if (batch <= 4) {
       platos_project_small_batch_f16_kernel<4><<<blocks, 256, 0, stream>>>(
           d_in_x, impl_->d_donor_mean, impl_->d_rt_f16, impl_->d_target_mean, impl_->scale, batch, d_in, d_out,
-          d_out_y);
+          impl_->mask_coord, d_out_y);
     } else {
       platos_project_small_batch_f16_kernel<8><<<blocks, 256, 0, stream>>>(
           d_in_x, impl_->d_donor_mean, impl_->d_rt_f16, impl_->d_target_mean, impl_->scale, batch, d_in, d_out,
-          d_out_y);
+          impl_->mask_coord, d_out_y);
     }
     CUDA_CHECK(cudaGetLastError());
   } else {
@@ -348,7 +352,8 @@ void PlatosKeyGpu::project(const float* d_in_x, int batch, float* d_out_y, bool 
     }
     const int threads = 256;
     const int c_blocks = static_cast<int>((need + threads - 1) / threads);
-    center_to_f16_kernel<<<c_blocks, threads, 0, stream>>>(d_in_x, impl_->d_donor_mean, batch, d_in, impl_->d_x_f16);
+    center_to_f16_kernel<<<c_blocks, threads, 0, stream>>>(d_in_x, impl_->d_donor_mean, batch, d_in, impl_->mask_coord,
+                                                           impl_->d_x_f16);
     CUDA_CHECK(cudaGetLastError());
 
     auto it = impl_->lt_plans.find(batch);

@@ -87,7 +87,11 @@ struct ParsedEmbeddingRequest {
 };
 
 // Validates and tokenizes a POST /v1/embeddings request body (standard OpenAI + opt-in Atlas extensions).
-// Throws BadRequest (HTTP 400) on invalid input, encoding_format, pooling, normalize, tap_layer, or platos_key.
+// Throws BadRequest (HTTP 400) on invalid input, encoding_format, pooling, normalize, tap_layer, platos_key,
+// cartridge_id, or cartridge_sha256. When `loaded_platos_key` is non-null, enforces its bound tap_layer/tap_spec
+// and cartridge identity fail-closed whenever `platos_key=true`.
+ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
+                                               int num_tap_layers, const PlatosKey* loaded_platos_key);
 ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
                                                int num_tap_layers, bool has_platos_key);
 

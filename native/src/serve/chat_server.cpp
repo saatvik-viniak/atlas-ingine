@@ -187,6 +187,7 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
       has_platos_key_(generator.has_platos_key()),
       platos_key_out_dim_(generator.platos_key_out_dim()),
       platos_key_tap_spec_(generator.platos_key_tap_spec()),
+      platos_key_(generator.platos_key()),
       sampling_defaults_(options.sampling),
       image_options_([&] {
         ImageOptions images = options.images;
@@ -197,6 +198,9 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
       cache_namespace_header_(std::move(options.cache_namespace_header)),
       created_(std::time(nullptr)),
       scheduler_(generator, fmt.stop_ids(), options.max_queue) {
+  if (platos_key_) {
+    platos_key_->validate_binding(model_id_, model_family_, embedding_dim_, num_tap_layers_);
+  }
   if (!options.warm_start_prompt.empty()) {
     if (!cache_namespace_header_.empty() && options.warm_start_namespace.empty()) {
       throw std::invalid_argument(
@@ -274,6 +278,14 @@ Json ChatServer::model_card() const {
             {"platos_key_out_dim", platos_key_out_dim_},
             {"input_modalities", image_options_.enabled ? Json::array({"text", "image"}) : Json::array({"text"})}};
   if (!platos_key_tap_spec_.empty()) card["platos_key_tap_spec"] = platos_key_tap_spec_;
+  if (platos_key_) {
+    const auto& pm = platos_key_->metadata();
+    card["platos_key_sha256"] = pm.file_sha256;
+    card["platos_key_layout"] = pm.tensor_layout;
+    if (!pm.donor_model.empty()) card["platos_key_donor_model"] = pm.donor_model;
+    if (!pm.cartridge_id.empty()) card["platos_key_cartridge_id"] = pm.cartridge_id;
+    if (pm.expected_tap_layer.has_value()) card["platos_key_tap_layer"] = *pm.expected_tap_layer;
+  }
   return card;
 }
 
@@ -335,6 +347,14 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
                 {"max_batch", st.max_batch},
                 {"max_queue", st.max_queue}};
     if (!platos_key_tap_spec_.empty()) health["platos_key_tap_spec"] = platos_key_tap_spec_;
+    if (platos_key_) {
+      const auto& pm = platos_key_->metadata();
+      health["platos_key_sha256"] = pm.file_sha256;
+      health["platos_key_layout"] = pm.tensor_layout;
+      if (!pm.donor_model.empty()) health["platos_key_donor_model"] = pm.donor_model;
+      if (!pm.cartridge_id.empty()) health["platos_key_cartridge_id"] = pm.cartridge_id;
+      if (pm.expected_tap_layer.has_value()) health["platos_key_tap_layer"] = *pm.expected_tap_layer;
+    }
     send_json(res, 200, health);
   } else if (path == "/v1/models") {
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
@@ -387,7 +407,10 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
         return;
       }
       if (!body.is_object()) throw BadRequest("request body must be a JSON object");
-      emb_req = parse_embedding_request(body, fmt_, max_model_len_, num_tap_layers_, has_platos_key_);
+      emb_req = parse_embedding_request(body, fmt_, max_model_len_, num_tap_layers_, platos_key_.get());
+      if (emb_req.request.use_platos_key && !has_platos_key_) {
+        throw BadRequest("'platos_key' requested but server was started without --platos-key", "platos_key");
+      }
     } catch (const BadRequest& e) {
       send_error(res, e.status, e.what(), e.param);
       return;

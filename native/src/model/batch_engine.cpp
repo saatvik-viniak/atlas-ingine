@@ -2173,6 +2173,9 @@ class BatchGenerator final : public Generator {
   std::string platos_key_tap_spec() const override {
     return platos_key_gpu_ ? platos_key_gpu_->metadata().tap_spec : "";
   }
+  std::shared_ptr<const PlatosKey> platos_key() const override {
+    return platos_key_gpu_ ? platos_key_gpu_->key() : nullptr;
+  }
   EmbeddingResult embed(const EmbeddingRequest& req) override {
     std::lock_guard<std::mutex> lock(mutex_);
     // Stateless zero-KV embedding prefill: never allocates a batch slot or touches pool_/prefix_cache_.
@@ -2425,10 +2428,11 @@ class BatchGenerator final : public Generator {
       }
     }
     if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, stream_);
+    prefiller_ = std::make_unique<Prefiller>(weights_, ablation_, prefill_chunk_, stream_);
     if (!options_.platos_key.empty()) {
       platos_key_gpu_ = PlatosKeyGpu::load(options_.platos_key, options_.platos_key_metadata, HIDDEN, stream_);
+      platos_key_gpu_->key()->validate_binding(model_id(), model_family(), HIDDEN, prefiller_->num_visits());
     }
-    prefiller_ = std::make_unique<Prefiller>(weights_, ablation_, prefill_chunk_, stream_);
     chunk_tokens_ = DeviceBuffer(std::size_t(prefill_chunk_) * sizeof(std::int32_t));
     prefill_logits_ = DeviceBuffer(std::size_t(UNPADDED_VOCAB) * sizeof(float));
     sampled_dev_ = DeviceBuffer(std::size_t(options_.max_batch) * sizeof(std::int32_t));
