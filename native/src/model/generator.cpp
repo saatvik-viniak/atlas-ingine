@@ -13,7 +13,9 @@
 //      during cold prefill and are never erased as "superseded" by longer child extensions.
 //   4. Optional disk KV checkpoint resume (`kv_ckpt_resume` / `kv_ckpt_path`).
 #include "ingine/generator.h"
+#include "ingine/platos_key.h"
 
+#include "backends/embedding_gemma2/eg2_cuda.h"
 #include "backends/qwen38/qwen38_dense_gpu.h"
 #include "backends/qwen4exp/qwen4exp_gpu.h"
 #include "core/arena.h"
@@ -146,6 +148,22 @@ class EngineGenerator final : public Generator {
   int max_model_len() const override { return options_.max_ctx; }
 
   bool supports_images() const override { return vision_ != nullptr; }
+  bool supports_embeddings() const override { return true; }
+  int embedding_dim() const override { return HIDDEN; }
+  int num_tap_layers() const override { return prefiller_.num_visits(); }
+  bool has_platos_key() const override { return platos_key_gpu_ != nullptr; }
+  int platos_key_out_dim() const override { return platos_key_gpu_ ? platos_key_gpu_->out_dim() : 0; }
+  std::string platos_key_tap_spec() const override {
+    return platos_key_gpu_ ? platos_key_gpu_->metadata().tap_spec : "";
+  }
+  std::shared_ptr<const PlatosKey> platos_key() const override {
+    return platos_key_gpu_ ? platos_key_gpu_->key() : nullptr;
+  }
+  EmbeddingResult embed(const EmbeddingRequest& req) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Stateless zero-KV embedding prefill: never reads or writes rt_.state(), checkpoint_, or parked_.
+    return prefiller_.embed(req, options_.max_ctx, platos_key_gpu_.get());
+  }
 
   PrefixCacheStats cache_stats() const override {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -257,6 +275,10 @@ class EngineGenerator final : public Generator {
 
     // the vision tower's weights are resident: loaded before the park budget below is measured
     if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, rt_.stream());
+    if (!options_.platos_key.empty()) {
+      platos_key_gpu_ = PlatosKeyGpu::load(options_.platos_key, options_.platos_key_metadata, HIDDEN, rt_.stream());
+      platos_key_gpu_->key()->validate_binding(model_id(), model_family(), HIDDEN, prefiller_.num_visits());
+    }
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
 
     if (!options_.prefix_cache) {
@@ -1448,6 +1470,7 @@ class EngineGenerator final : public Generator {
   std::unique_ptr<Drafter> drafter_;
   std::unique_ptr<SpecLoop> spec_;
   std::unique_ptr<VisionEncoder> vision_;  // image input (RuntimeOptions::vision)
+  std::shared_ptr<const PlatosKeyGpu> platos_key_gpu_;  // optional --platos-key projection for /v1/embeddings
   DeviceBuffer chunk_tokens_, logits_, token_, taps_;
   DeviceBuffer masked_logits_, mask_dev_;
   std::vector<std::uint32_t> mask_host_;
@@ -1574,6 +1597,14 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
 #else
       backends::qwen4exp::register_qwen4exp_cuda_backend();
       return BackendRegistry::instance().create(ModelFamily::Qwen4Exp, options);
+#endif
+    }
+    if (family == ModelFamily::EmbeddingGemma2) {
+#if INGINE_TP_SIZE > 1
+      throw std::invalid_argument("embeddinggemma2-cuda does not support INGINE_TP_SIZE > 1");
+#else
+      backends::embedding_gemma2::register_eg2_cuda_backend();
+      return BackendRegistry::instance().create(ModelFamily::EmbeddingGemma2, options);
 #endif
     }
     if (family != ModelFamily::Inkling2) {

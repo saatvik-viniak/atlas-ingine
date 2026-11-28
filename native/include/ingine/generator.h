@@ -3,6 +3,7 @@
 #pragma once
 
 #include "ingine/persona.h"
+#include "ingine/platos_key.h"
 #include "ingine/prefix_cache.h"
 #include "ingine/token_masker.h"
 
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -229,6 +231,8 @@ struct RuntimeOptions {
   bool prefix_cache = true;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
+  // Audio input: load the audio tower (for multimodal encoders such as EmbeddingGemma 2).
+  bool audio = false;
   // Dynamic 3-tier MoE expert offloading (atlas-6g-homology):
   //   offload_vram_mb == 0: disabled (all experts resident in VRAM).
   //   offload_vram_mb > 0:  target VRAM cap in MiB (e.g. 6144 for 6 GB GPUs); non-expert weights, KV cache,
@@ -278,6 +282,83 @@ struct RuntimeOptions {
   // Mech-interp / persona hook options: pre-capture hooked CUDA graphs when enabled, and enforce refusal map.
   bool enable_persona_hooks = false;
   std::filesystem::path refusal_map;
+  // Optional Plato's Key projection (.safetensors + optional sidecar JSON metadata) for /v1/embeddings.
+  std::filesystem::path platos_key;
+  std::filesystem::path platos_key_metadata;
+};
+
+// Pooling strategy for POST /v1/embeddings (zero-KV, no-lm_head prefill path).
+enum class EmbeddingPooling : std::uint8_t {
+  Mean = 0,
+  LastToken = 1,
+  Cls = 2,
+};
+
+inline const char* to_string(EmbeddingPooling p) noexcept {
+  switch (p) {
+    case EmbeddingPooling::LastToken: return "last_token";
+    case EmbeddingPooling::Cls: return "cls";
+    default: return "mean";
+  }
+}
+
+inline EmbeddingPooling parse_embedding_pooling(std::string_view s) {
+  if (s == "mean") return EmbeddingPooling::Mean;
+  if (s == "last_token") return EmbeddingPooling::LastToken;
+  if (s == "cls") return EmbeddingPooling::Cls;
+  throw std::invalid_argument("invalid pooling '" + std::string(s) +
+                              "' (expected 'mean', 'last_token', or 'cls')");
+}
+
+struct EmbeddingImage {
+  int width = 0;
+  int height = 0;
+  std::vector<std::uint8_t> rgb;  // [height, width, 3] raw RGB bytes
+  int max_soft_tokens = 280;      // {70, 140, 280, 560, 1120}; default 280 images, 140 video frames
+  bool is_video_frame = false;    // true -> expands <|video|>, false -> <|image|>
+};
+
+struct EmbeddingAudio {
+  int sample_rate = 16000;        // Hz (normalized to 16000 Hz mono by decoder)
+  std::vector<float> samples;     // mono PCM normalized to [-1, 1]
+};
+
+struct EmbeddingRequest {
+  std::vector<std::vector<std::int32_t>> inputs;  // non-empty batch of non-empty token-id sequences
+  // Optional per-item multimodal images / video frames (empty for text-only requests; when non-empty,
+  // images.size() == inputs.size() and total soft tokens per item equals <|image|>/<|video|> placeholders).
+  std::vector<std::vector<EmbeddingImage>> images;
+  // Optional per-item multimodal audio clips (empty for non-audio requests; when non-empty,
+  // audios.size() == inputs.size() and total audio soft tokens per item equals <|audio|> placeholders).
+  std::vector<std::vector<EmbeddingAudio>> audios;
+  EmbeddingPooling pooling = EmbeddingPooling::Mean;
+  bool normalize = true;
+  // Optional early-exit layer/visit index (0-based). std::nullopt = full forward pass + final norm.
+  std::optional<int> tap_layer;
+  // Opt-in in-GPU Plato's Key projection (requires server started with --platos-key).
+  bool use_platos_key = false;
+  // Optional #964 cartridge identity pins verified fail-closed against the loaded Plato's Key.
+  std::optional<std::string> cartridge_id;
+  std::optional<std::string> cartridge_sha256;
+  // Optional Matryoshka output dimension (OpenAI "dimensions"); truncation happens before L2 re-normalization.
+  std::optional<int> dimensions;
+  // Optional named task prefix applied before tokenization (e.g. "SearchQuery", "Document" on EmbeddingGemma 2).
+  std::optional<std::string> prompt_name;
+};
+
+struct EmbeddingStats {
+  int total_prompt_tokens = 0;
+  double prefill_seconds = 0.0;
+  double platos_key_seconds = 0.0;
+  int effective_tap_layer = -1;  // -1 = full depth (final normed hidden), else 0-based early-exit layer/visit
+  int output_dim = 0;
+  int kv_slots_allocated = 0;
+  bool lm_head_skipped = true;
+};
+
+struct EmbeddingResult {
+  std::vector<std::vector<float>> embeddings;  // [inputs.size()][output_dim]
+  EmbeddingStats stats;
 };
 
 // One active sequence entering a batched decode step (continuous batching).
@@ -332,6 +413,8 @@ class Generator {
     throw std::invalid_argument("warm_start is not supported by this generator backend (no prefix cache)");
   }
   virtual bool supports_images() const { return false; }
+  virtual bool supports_audio() const { return false; }
+  virtual bool is_encoder_only() const { return false; }
   virtual bool supports_logit_masker() const { return true; }
   virtual std::string model_family() const { return "inkling2"; }
   virtual KvCacheMode kv_cache_mode() const { return KvCacheMode::PerPass; }
@@ -344,6 +427,23 @@ class Generator {
   virtual AttnRequantMode attn_requant_mode() const { return AttnRequantMode::Off; }
   virtual std::string offload_summary() const { return {}; }
   virtual PrefixCacheStats cache_stats() const { return {}; }
+
+  // ---- Zero-KV, no-lm_head batched embedding interface (POST /v1/embeddings)
+  virtual bool supports_embeddings() const { return false; }
+  virtual int embedding_dim() const { return 0; }
+  // Hidden width at intermediate early-exit tap layers (equals embedding_dim() on models without post-pool projection;
+  // differs on EmbeddingGemma 2 where hidden_size=512 at tap layers and embedding_dim=768 after embedding_projection).
+  virtual int tap_embedding_dim() const { return embedding_dim(); }
+  virtual int num_tap_layers() const { return 0; }
+  virtual std::vector<int> matryoshka_dims() const { return {}; }
+  virtual std::map<std::string, std::string> embedding_prompt_prefixes() const { return {}; }
+  virtual bool has_platos_key() const { return false; }
+  virtual int platos_key_out_dim() const { return 0; }
+  virtual std::string platos_key_tap_spec() const { return {}; }
+  virtual std::shared_ptr<const PlatosKey> platos_key() const { return nullptr; }
+  virtual EmbeddingResult embed(const EmbeddingRequest& /*req*/) {
+    throw std::runtime_error("embeddings are not supported by this generator backend");
+  }
 
   // ---- Optional continuous-batching interface (used by Scheduler and ingine-bench when max_batch_size() > 1)
   virtual int max_batch_size() const { return 1; }

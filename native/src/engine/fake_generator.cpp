@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <optional>
 #include <cstring>
+#include <stdexcept>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -386,6 +388,158 @@ std::vector<FakeGenerator::Call> FakeGenerator::calls() const {
 std::vector<FakeGenerator::Call> FakeGenerator::warm_start_calls() const {
   std::lock_guard lock(mutex_);
   return warm_start_calls_;
+}
+
+void FakeGenerator::set_platos_key(std::shared_ptr<const PlatosKey> key) {
+  if (key) {
+    key->validate_binding(model_id_, model_family_, embedding_dim_, num_tap_layers_, tap_embedding_dim());
+  }
+  std::lock_guard lock(mutex_);
+  platos_key_ = std::move(key);
+}
+
+void FakeGenerator::load_platos_key(const std::filesystem::path& safetensors_path,
+                                    const std::filesystem::path& metadata_json_path) {
+  const int expected = (tap_embedding_dim() == embedding_dim_) ? embedding_dim_ : 0;
+  auto key = PlatosKey::load(safetensors_path, metadata_json_path, expected);
+  set_platos_key(std::move(key));
+}
+
+std::vector<FakeGenerator::EmbeddingCall> FakeGenerator::embedding_calls() const {
+  std::lock_guard lock(mutex_);
+  return embedding_calls_;
+}
+
+model::EmbeddingResult FakeGenerator::embed(const model::EmbeddingRequest& req) {
+  if (!supports_embeddings_) {
+    throw std::runtime_error("embeddings are disabled on this FakeGenerator");
+  }
+  if (req.inputs.empty()) {
+    throw std::invalid_argument("embed: inputs must not be empty");
+  }
+  if (req.tap_layer.has_value() && (*req.tap_layer < 0 || *req.tap_layer >= num_tap_layers_)) {
+    throw std::invalid_argument("embed: tap_layer " + std::to_string(*req.tap_layer) + " out of range [0, " +
+                                std::to_string(num_tap_layers_ - 1) + "]");
+  }
+  std::shared_ptr<const PlatosKey> pk;
+  {
+    std::lock_guard lock(mutex_);
+    pk = platos_key_;
+  }
+  if (req.use_platos_key && !pk) {
+    throw std::invalid_argument("embed: platos_key requested but no --platos-key is loaded");
+  }
+  if (req.use_platos_key) {
+    pk->validate_request_tap(req.tap_layer);
+    pk->validate_request_identity(req.cartridge_id.value_or(""), req.cartridge_sha256.value_or(""));
+  }
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const int B = static_cast<int>(req.inputs.size());
+  const int H = req.tap_layer.has_value() ? tap_embedding_dim() : embedding_dim_;
+  if (req.use_platos_key && pk->in_dim() != H) {
+    throw std::invalid_argument("embed: platos_key d_in (" + std::to_string(pk->in_dim()) +
+                                ") does not match embedding input dim (" + std::to_string(H) + ")");
+  }
+  const int effective_tap = req.tap_layer.value_or(-1);
+  // Deterministic causal per-token synthetic hidden state H(seq, pos, layer, dim):
+  // strictly causal (depends only on tokens 0..pos) and sensitive to tap_layer so tests verify pooling + early exit.
+  const double layer_phase = effective_tap >= 0 ? static_cast<double>(effective_tap + 1) * 0.37 : 99.13;
+
+  int total_tokens = 0;
+  std::vector<float> pooled(static_cast<std::size_t>(B) * static_cast<std::size_t>(H), 0.0f);
+  for (int b = 0; b < B; ++b) {
+    const auto& seq = req.inputs[static_cast<std::size_t>(b)];
+    if (seq.empty()) throw std::invalid_argument("embed: input sequence must not be empty");
+    if (static_cast<int>(seq.size()) > max_model_len_) {
+      throw std::invalid_argument("embed: input sequence length " + std::to_string(seq.size()) +
+                                  " exceeds max_model_len " + std::to_string(max_model_len_));
+    }
+    total_tokens += static_cast<int>(seq.size());
+    const int L = static_cast<int>(seq.size());
+    auto token_hidden = [&](int pos, int d) -> double {
+      std::uint64_t h = 0x9e3779b97f4a7c15ull ^ static_cast<std::uint64_t>(d + 1) * 0xbf58476d1ce4e5b9ull;
+      for (int k = 0; k <= pos; ++k) {
+        h ^= static_cast<std::uint64_t>(seq[static_cast<std::size_t>(k)] + 1315423911u) * 0x94d049bb133111ebull;
+        h = (h << 13) | (h >> 51);
+      }
+      const double base = static_cast<double>(static_cast<std::int64_t>(h % 2001ull) - 1000ll) / 1000.0;
+      return std::sin(base * 2.5 + layer_phase + static_cast<double>(d) * 0.11);
+    };
+    float* dst = pooled.data() + static_cast<std::size_t>(b) * static_cast<std::size_t>(H);
+    for (int d = 0; d < H; ++d) {
+      if (req.pooling == model::EmbeddingPooling::Cls) {
+        dst[d] = static_cast<float>(token_hidden(0, d));
+      } else if (req.pooling == model::EmbeddingPooling::LastToken) {
+        dst[d] = static_cast<float>(token_hidden(L - 1, d));
+      } else {
+        double sum = 0.0;
+        for (int pos = 0; pos < L; ++pos) sum += token_hidden(pos, d);
+        dst[d] = static_cast<float>(sum / static_cast<double>(L));
+      }
+    }
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+
+  int out_dim = H;
+  std::vector<float> final_flat;
+  double pk_seconds = 0.0;
+  if (req.use_platos_key) {
+    if (req.dimensions.has_value()) {
+      throw std::invalid_argument("embed: 'dimensions' cannot be combined with 'platos_key'");
+    }
+    const auto tp0 = std::chrono::steady_clock::now();
+    out_dim = pk->out_dim();
+    final_flat.resize(static_cast<std::size_t>(B) * static_cast<std::size_t>(out_dim));
+    pk->project_cpu(pooled.data(), B, final_flat.data(), req.normalize);
+    pk_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
+  } else {
+    if (req.dimensions.has_value()) {
+      const int d = *req.dimensions;
+      if (d <= 0 || d > H) {
+        throw std::invalid_argument("embed: dimensions " + std::to_string(d) + " out of range [1, " +
+                                    std::to_string(H) + "]");
+      }
+      if (!matryoshka_dims_.empty() &&
+          std::find(matryoshka_dims_.begin(), matryoshka_dims_.end(), d) == matryoshka_dims_.end()) {
+        throw std::invalid_argument("embed: dimensions " + std::to_string(d) + " not in matryoshka_dims");
+      }
+      out_dim = d;
+    }
+    if (out_dim == H) {
+      final_flat = std::move(pooled);
+    } else {
+      final_flat.resize(static_cast<std::size_t>(B) * static_cast<std::size_t>(out_dim));
+      for (int b = 0; b < B; ++b) {
+        std::memcpy(final_flat.data() + static_cast<std::size_t>(b) * static_cast<std::size_t>(out_dim),
+                    pooled.data() + static_cast<std::size_t>(b) * static_cast<std::size_t>(H),
+                    static_cast<std::size_t>(out_dim) * sizeof(float));
+      }
+    }
+    if (req.normalize) l2_normalize_rows_cpu(final_flat.data(), B, out_dim);
+  }
+
+  model::EmbeddingResult res;
+  res.embeddings.resize(static_cast<std::size_t>(B));
+  for (int b = 0; b < B; ++b) {
+    const float* row = final_flat.data() + static_cast<std::size_t>(b) * static_cast<std::size_t>(out_dim);
+    res.embeddings[static_cast<std::size_t>(b)].assign(row, row + out_dim);
+  }
+  res.stats.total_prompt_tokens = total_tokens;
+  res.stats.prefill_seconds = std::chrono::duration<double>(t1 - t0).count();
+  res.stats.platos_key_seconds = pk_seconds;
+  res.stats.effective_tap_layer = effective_tap;
+  res.stats.output_dim = out_dim;
+  res.stats.kv_slots_allocated = 0;
+  res.stats.lm_head_skipped = true;
+
+  {
+    std::lock_guard lock(mutex_);
+    embedding_calls_.push_back(EmbeddingCall{req.inputs, req.pooling, req.normalize, req.tap_layer, req.use_platos_key,
+                                             req.dimensions, req.prompt_name, res.stats.kv_slots_allocated,
+                                             res.stats.lm_head_skipped});
+  }
+  return res;
 }
 
 }  // namespace ingine::engine

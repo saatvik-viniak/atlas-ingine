@@ -1,4 +1,6 @@
 // ingine-serve: the OpenAI-compatible chat completions server (flags and defaults of `python -m ingine.server`).
+#include "backends/embedding_gemma2/eg2_config.h"
+#include "backends/embedding_gemma2/eg2_cpu.h"
 #include "engine/fake_generator.h"
 #include "engine/log.h"
 #include "image/image.h"
@@ -99,13 +101,14 @@ int main(int argc, char** argv) {
   std::string attn_requant = "off";
   std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1", cache_namespace_header;
   std::string warm_start_prompt, warm_start_file, warm_start_namespace;
+  std::string platos_key, platos_key_metadata;
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1,
       park_host_mb = 0;
   int max_batch = 1, max_kv_tokens = 0, loop_passes = 3;
   int offload_vram_mb = 0, offload_ram_mb = 12288, expert_swaps = 0;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_fp4v = false, kv_q4 = false, kv_paged = false, spec = false,
-       no_vision = false, atlas_6g = false, loop_bf16 = false, persona_probe_mode = false, no_prefix_cache = false;
+       no_vision = false, no_audio = false, atlas_6g = false, loop_bf16 = false, persona_probe_mode = false, no_prefix_cache = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02, loopcd_omega = -1.0;
   // sampling defaults; negative: from generation_config.json
@@ -198,8 +201,16 @@ int main(int argc, char** argv) {
             "prefix-cache namespace for startup warm-start (required when combining warm-start with --cache-namespace-header)",
             &warm_start_namespace);
   ap.exclusive({"--warm-start-prompt", "--warm-start-file"}, false);
+  ap.option("--platos-key", "",
+            "optional Plato's Key .safetensors projection for POST /v1/embeddings (enabled per-request via platos_key=true)",
+            &platos_key);
+  ap.option("--platos-key-metadata", "",
+            "optional sidecar JSON metadata file validated against --platos-key tensor dimensions",
+            &platos_key_metadata);
   ap.flag("--no-vision", "text only: do not load the vision tower (saves 0.6 GB) and reject requests with images",
           &no_vision);
+  ap.flag("--no-audio", "do not load the audio tower (saves 583 MiB on EmbeddingGemma 2) and reject audio inputs",
+          &no_audio);
   ap.option("--image-max-tokens", "",
             "tokens of one image (one per 40x40 pixels); a larger image is reduced to fit (at most 10609)",
             &image_max_tokens);
@@ -296,6 +307,10 @@ int main(int argc, char** argv) {
     std::cerr << "ingine-serve: error: --warm-start-namespace requires --warm-start-prompt or --warm-start-file\n";
     return 2;
   }
+  if (!platos_key_metadata.empty() && platos_key.empty()) {
+    std::cerr << "ingine-serve: error: --platos-key-metadata requires --platos-key\n";
+    return 2;
+  }
 
   auto& log = ingine::engine::server_log();
   if (!ingine::engine::set_log_level(log_level)) {
@@ -330,7 +345,36 @@ int main(int argc, char** argv) {
 
     const ingine::text::ChatFormat fmt = ingine::text::ChatFormat::load(model_dir);
     const bool is_qwen35 = (fmt.kind() == ingine::text::ChatFormatKind::Qwen3_5);
+    const bool is_eg2 = (fmt.kind() == ingine::text::ChatFormatKind::EmbeddingGemma2);
     const bool loop_passes_explicit = ap.given("--loop-passes");
+    if (is_eg2) {
+      if (loop_passes_explicit) {
+        throw std::invalid_argument("embedding_gemma2 is an encoder-only model and does not support --loop-passes");
+      }
+      if (parsed_loopcd_mode != ingine::model::LoopCdMode::Off) {
+        throw std::invalid_argument("embedding_gemma2 is an encoder-only model and does not support --loopcd");
+      }
+      if (loop_bf16) {
+        throw std::invalid_argument("embedding_gemma2 does not support --loop-bf16");
+      }
+      if (parsed_attn_requant != ingine::model::AttnRequantMode::Off) {
+        throw std::invalid_argument("embedding_gemma2 does not support --attn-requant");
+      }
+      if (expert_swaps != 0 || offload_vram_mb != 0) {
+        throw std::invalid_argument("embedding_gemma2 has no MoE experts and does not support MoE offload options");
+      }
+      if (spec) {
+        throw std::invalid_argument("embedding_gemma2 is an encoder-only model and does not support --spec");
+      }
+      if (kv_fp8 || kv_q4 || kv_paged || kv_vram_mb != 0) {
+        throw std::invalid_argument("embedding_gemma2 is stateless (zero KV cache) and does not support KV cache flags");
+      }
+      if (!ablation.empty() || personas != nullptr || persona_probe_mode || !refusal_map.empty()) {
+        throw std::invalid_argument("embedding_gemma2 does not support Inkling ablation/persona hooks");
+      }
+      if (!ap.given("--max-ctx")) max_ctx = 8192;
+      // EmbeddingGemma 2 supports text + vision + audio natively; --no-vision / --no-audio opt out cleanly.
+    }
     if (is_qwen35) {
       if (loop_passes_explicit) {
         throw std::invalid_argument(
@@ -358,7 +402,24 @@ int main(int argc, char** argv) {
     std::unique_ptr<ingine::model::Generator> generator;
     if (fake) {
       const auto parsed_kv_mode = ingine::model::parse_kv_cache_mode(kv_cache_mode);
-      if (is_qwen35) {
+      if (is_eg2) {
+        auto eg2_cfg = ingine::backends::embedding_gemma2::Eg2Config::load(model_dir);
+        auto efake = std::make_unique<ingine::engine::FakeGenerator>(
+            fmt.tokenizer(), "embeddinggemma-2-fake", max_ctx, ingine::engine::FakeGenerator::Responder{}, fake_delay,
+            /*loop_passes=*/1, ingine::model::KvCacheMode::PerPass, /*allow_last_full=*/false);
+        efake->set_model_family("embedding_gemma2");
+        efake->set_is_encoder_only(true);
+        efake->set_supports_logit_masker(false);
+        efake->set_supports_images(false);
+        efake->set_supports_audio(false);
+        efake->set_embedding_dim(eg2_cfg.embedding_dim);
+        efake->set_tap_embedding_dim(eg2_cfg.hidden_size);
+        efake->set_num_tap_layers(eg2_cfg.num_hidden_layers);
+        efake->set_matryoshka_dims(eg2_cfg.matryoshka_dims);
+        efake->set_embedding_prompt_prefixes(eg2_cfg.prompts);
+        if (!platos_key.empty()) efake->load_platos_key(platos_key, platos_key_metadata);
+        generator = std::move(efake);
+      } else if (is_qwen35) {
         if (parsed_kv_mode != ingine::model::KvCacheMode::PerPass) {
           throw std::invalid_argument("qwen38-dense does not support --kv-cache-mode " + kv_cache_mode +
                                       " (only per_pass is supported)");
@@ -381,6 +442,9 @@ int main(int argc, char** argv) {
         qfake->set_model_family("qwen3_5");
         qfake->set_supports_logit_masker(false);
         qfake->set_supports_images(false);
+        qfake->set_embedding_dim(5120);
+        qfake->set_num_tap_layers(64);
+        if (!platos_key.empty()) qfake->load_platos_key(platos_key, platos_key_metadata);
         generator = std::move(qfake);
       } else {
         if (loop_passes != 3) {
@@ -444,6 +508,9 @@ int main(int argc, char** argv) {
             fmt.tokenizer(), "Inkling-2-Mini-fake", tokenizer_max_length(model_dir),
             ingine::engine::FakeGenerator::Responder{}, fake_delay, loop_passes, parsed_kv_mode, fake_allow_last_full);
         ifake->set_loopcd_mode(parsed_loopcd_mode);
+        ifake->set_embedding_dim(2304);
+        ifake->set_num_tap_layers(6 + loop_passes * 12 + 6);
+        if (!platos_key.empty()) ifake->load_platos_key(platos_key, platos_key_metadata);
         generator = std::move(ifake);
       }
     } else {
@@ -482,6 +549,7 @@ int main(int argc, char** argv) {
       options.park_host_mb = park_host_mb;
       options.prefix_cache = !no_prefix_cache;
       options.vision = !no_vision;
+      options.audio = !no_audio;
       options.offload_vram_mb = offload_vram_mb;
       options.offload_ram_mb = offload_ram_mb;
       options.offload_mode = offload_mode;
@@ -498,13 +566,26 @@ int main(int argc, char** argv) {
       options.expert_swaps = expert_swaps;
       options.enable_persona_hooks = (personas != nullptr) || persona_probe_mode;
       options.refusal_map = refusal_map;
+      options.platos_key = platos_key;
+      options.platos_key_metadata = platos_key_metadata;
       generator = ingine::model::make_generator(options);
 #if defined(__linux__)
       maybe_log_gpu_unlock_notice(log);
 #endif
 #else
-      log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");
-      return 1;
+      if (is_eg2) {
+        ingine::model::RuntimeOptions options;
+        options.model_dir = model_dir;
+        options.max_ctx = max_ctx;
+        options.vision = !no_vision;
+        options.audio = !no_audio;
+        options.platos_key = platos_key;
+        options.platos_key_metadata = platos_key_metadata;
+        generator = std::make_unique<ingine::backends::embedding_gemma2::Eg2CpuBackend>(options);
+      } else {
+        log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");
+        return 1;
+      }
 #endif
     }
 
@@ -539,9 +620,14 @@ int main(int argc, char** argv) {
                                     ? fmt::format("on (at most {} tokens per image, {} images and {} image tokens per request)",
                                                   image_max_tokens, max_images, max_image_tokens)
                                     : std::string("off"));
-    log.info("serving {} on http://{}:{}/v1 (kv_cache_mode={}, loop_passes={}, loopcd={})", server.model_id(), host,
-             server.port(), ingine::model::to_string(generator->kv_cache_mode()), generator->loop_passes(),
-             ingine::model::to_string(generator->loopcd_mode()));
+    log.info("serving {} on http://{}:{}/v1 (kv_cache_mode={}, loop_passes={}, loopcd={}, embeddings={}, platos_key={})",
+             server.model_id(), host, server.port(), ingine::model::to_string(generator->kv_cache_mode()),
+             generator->loop_passes(), ingine::model::to_string(generator->loopcd_mode()),
+             generator->supports_embeddings() ? fmt::format("on(dim={},taps={})", generator->embedding_dim(),
+                                                            generator->num_tap_layers())
+                                              : std::string("off"),
+             generator->has_platos_key() ? fmt::format("on(out_dim={})", generator->platos_key_out_dim())
+                                         : std::string("off"));
     bool listened = true;
     std::thread listener([&] {
       listened = server.listen();

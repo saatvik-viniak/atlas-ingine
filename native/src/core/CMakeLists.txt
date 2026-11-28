@@ -9,6 +9,8 @@ if(INGINE_BACKEND STREQUAL "CUDA")
     hal_cuda.cpp
     host_memory.cpp
     paged_tier.cpp
+    platos_key.cpp
+    platos_key_cuda.cu
     safetensors_io.cpp
     safetensors_upload_cuda.cpp
     tensor.cpp
@@ -17,7 +19,7 @@ if(INGINE_BACKEND STREQUAL "CUDA")
   ingine_cuda_target(ingine_core)
   target_compile_definitions(ingine_core PUBLIC INGINE_BACKEND_CUDA=1 INGINE_BACKEND_CPU=0)
   target_link_libraries(ingine_core PUBLIC
-    CUDA::cudart CUDA::nvtx3 Threads::Threads spdlog::spdlog nlohmann_json::nlohmann_json)
+    CUDA::cudart CUDA::cublasLt CUDA::nvtx3 Threads::Threads spdlog::spdlog nlohmann_json::nlohmann_json)
 
   add_library(ingine_ops STATIC
     cpu_kernels.cpp
@@ -33,6 +35,7 @@ else()
     dtype.cpp
     gguf.cpp
     hal_cpu.cpp
+    platos_key.cpp
     safetensors_io.cpp
     safetensors_upload_cpu.cpp
     tensor.cpp

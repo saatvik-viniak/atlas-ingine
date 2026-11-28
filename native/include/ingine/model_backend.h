@@ -35,6 +35,7 @@ enum class ModelFamily : std::uint8_t {
   DeepSeekV4 = 3,
   GlmFlash = 4,
   Qwen4Exp = 5,
+  EmbeddingGemma2 = 6,
 };
 
 enum class CheckpointFormat : std::uint8_t {
@@ -117,6 +118,7 @@ struct BackendCapabilities {
   std::string architecture;
   bool supports_text = true;
   bool supports_images = false;
+  bool supports_audio = false;
   bool supports_speculation = false;
   bool supports_continuous_batching = false;
   int max_supported_batch = 1;

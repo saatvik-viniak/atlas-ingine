@@ -236,4 +236,44 @@ Image decode_data_uri(std::string_view uri, const Limits& limits) {
   return decode(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()), limits);
 }
 
+Image decode_raw_rgb(std::span<const std::uint8_t> bytes, const Limits& limits) {
+  if (bytes.empty()) throw Error("image is empty");
+  if (bytes.size() > std::size_t(0x7FFFFFFF)) throw Error("image is too large");
+  Raw raw = is_webp(bytes) ? decode_webp(bytes, limits) : decode_stb(bytes, limits);
+  const int width = raw.width, height = raw.height, channels = raw.channels;
+
+  Image image;
+  image.source_width = width;
+  image.source_height = height;
+  image.width = width;
+  image.height = height;
+  image.rgb.resize(std::size_t(width) * height * 3);
+  const std::uint8_t* src = raw.pixels.get();
+  const bool grey = channels <= 2;
+  for (int y = 0; y < height; ++y) {
+    std::uint8_t* dst = image.rgb.data() + std::size_t(y) * width * 3;
+    for (int x = 0; x < width; ++x, src += channels, dst += 3) {
+      dst[0] = src[0];
+      dst[1] = grey ? src[0] : src[1];
+      dst[2] = grey ? src[0] : src[2];
+    }
+  }
+  image.hash = hash_pixels(image.width, image.height, image.rgb);
+  return image;
+}
+
+Image decode_raw_rgb_data_uri(std::string_view uri, const Limits& limits) {
+  if (!starts_with_nocase(uri, "data:")) throw Error("only data: URIs are supported for images");
+  const std::size_t comma = uri.find(',');
+  if (comma == std::string_view::npos) throw Error("image data: URI has no data");
+  const std::string_view header = uri.substr(5, comma - 5);
+  constexpr std::string_view marker = ";base64";
+  if (header.size() < marker.size() || !starts_with_nocase(header.substr(header.size() - marker.size()), marker)) {
+    throw Error("image data: URI must be base64-encoded (data:image/png;base64,...)");
+  }
+  const std::string bytes = decode_base64(uri.substr(comma + 1));
+  return decode_raw_rgb(
+      std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()), limits);
+}
+
 }  // namespace ingine::image

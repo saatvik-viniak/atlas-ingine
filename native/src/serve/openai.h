@@ -9,7 +9,9 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -74,5 +76,51 @@ std::string dump(const Json& value);
 
 // Python truthiness of a JSON value.
 bool truthy(const Json& value);
+
+enum class EmbeddingEncodingFormat : std::uint8_t {
+  Float = 0,
+  Base64 = 1,
+};
+
+struct ParsedEmbeddingRequest {
+  model::EmbeddingRequest request;
+  EmbeddingEncodingFormat encoding_format = EmbeddingEncodingFormat::Float;
+};
+
+struct EmbeddingParseOptions {
+  int max_model_len = 0;
+  int embedding_dim = 0;
+  int tap_embedding_dim = 0;     // intermediate tap dim when distinct from embedding_dim (0 => embedding_dim)
+  int num_tap_layers = 0;
+  bool has_platos_key = false;
+  const PlatosKey* loaded_platos_key = nullptr;
+  bool supports_images = false;
+  bool supports_audio = false;
+  int vision_soft_tokens_per_image = 280;
+  int video_soft_tokens_per_frame = 140;
+  image::Limits image_limits;
+  int max_images = 16;           // per-request image + video frame limit across the entire batch (<0 disables)
+  int max_total_tokens = 32768;  // per-request image + video soft token limit across the entire batch (<0 disables)
+  std::vector<int> matryoshka_dims;
+  std::map<std::string, std::string> prompt_prefixes;
+};
+
+// Validates and tokenizes a POST /v1/embeddings request body (standard OpenAI + Matryoshka dimensions +
+// optional task prompt_name + opt-in Atlas extensions). Throws BadRequest (HTTP 400) on invalid parameters.
+// When `opts.loaded_platos_key` is non-null, enforces its bound tap_layer/tap_spec and cartridge identity
+// fail-closed whenever `platos_key=true`.
+ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt,
+                                               const EmbeddingParseOptions& opts);
+ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
+                                               int num_tap_layers, const PlatosKey* loaded_platos_key);
+ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
+                                               int num_tap_layers, bool has_platos_key);
+
+// Encodes contiguous little-endian IEEE-754 float32 values as RFC 4648 base64 (OpenAI encoding_format="base64").
+std::string encode_embedding_base64(std::span<const float> vec);
+
+// Formats exact OpenAI POST /v1/embeddings response JSON.
+Json embedding_response_json(const std::string& model_id, const model::EmbeddingResult& result,
+                             EmbeddingEncodingFormat format);
 
 }  // namespace ingine::serve

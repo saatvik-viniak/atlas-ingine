@@ -29,6 +29,7 @@ target_link_libraries(ingine_model PUBLIC
   ingine_persona
   ingine_qwen38_cuda
   ingine_qwen4exp_cuda
+  ingine_eg2_cuda
   ingine_kernels_dense
   ingine_kernels_moe
   ingine_kernels_attn

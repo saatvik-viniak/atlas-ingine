@@ -69,6 +69,7 @@ class ChatServer {
   void handle_post(const httplib::Request& req, httplib::Response& res);
   void complete(const httplib::Request& req, httplib::Response& res, ChatRequest request);
   void complete_anthropic(const httplib::Request& req, httplib::Response& res, ChatRequest request);
+  void complete_embedding(const httplib::Request& req, httplib::Response& res, ParsedEmbeddingRequest request);
   Json model_card() const;
   Json supported_kv_cache_modes_json() const;
   Json personas_list() const;
@@ -82,6 +83,18 @@ class ChatServer {
   const int loop_passes_;
   const model::LoopCdMode loopcd_mode_;
   const bool supports_logit_masker_;
+  const bool supports_audio_;
+  const bool is_encoder_only_;
+  const bool supports_embeddings_;
+  const int embedding_dim_;
+  const int tap_embedding_dim_;
+  const int num_tap_layers_;
+  const std::vector<int> matryoshka_dims_;
+  const std::map<std::string, std::string> embedding_prompt_prefixes_;
+  const bool has_platos_key_;
+  const int platos_key_out_dim_;
+  const std::string platos_key_tap_spec_;
+  const std::shared_ptr<const PlatosKey> platos_key_;
   const model::Sampling sampling_defaults_;
   const ImageOptions image_options_;
   const std::shared_ptr<const persona::PersonaCatalog> personas_;

@@ -191,6 +191,10 @@ ModelFamily classify_safetensors_tag(std::string_view tag) {
       lower == "glm5nextforconditionalgeneration" || lower == "glm5nextforcausallm") {
     return ModelFamily::GlmFlash;
   }
+  if (lower == "embedding_gemma2" || lower == "embedding_gemma2_text" || lower == "embeddinggemma2model" ||
+      lower == "embeddinggemma2") {
+    return ModelFamily::EmbeddingGemma2;
+  }
   return ModelFamily::Unknown;
 }
 
@@ -358,6 +362,7 @@ const char* to_string(ModelFamily family) noexcept {
     case ModelFamily::DeepSeekV4: return "deepseek_v4";
     case ModelFamily::GlmFlash: return "glm_flash";
     case ModelFamily::Qwen4Exp: return "qwen4exp";
+    case ModelFamily::EmbeddingGemma2: return "embedding_gemma2";
     default: return "unknown";
   }
 }
@@ -422,6 +427,10 @@ ModelFamily parse_model_family(std::string_view s) {
   if (lower == "glm_flash" || lower == "glm53" || lower == "glm_53_flash" || lower == "glm5-next" ||
       lower == "glm5_next") {
     return ModelFamily::GlmFlash;
+  }
+  if (lower == "embedding_gemma2" || lower == "embeddinggemma2" || lower == "embeddinggemma-2" ||
+      lower == "embedding-gemma-2") {
+    return ModelFamily::EmbeddingGemma2;
   }
   throw std::invalid_argument("unknown model family '" + std::string(s) + "'");
 }

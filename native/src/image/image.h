@@ -60,9 +60,19 @@ struct Image {
 // "data:[<media type>];base64,<data>" -> Image. The media type is ignored: the bytes say what they are.
 [[nodiscard]] Image decode_data_uri(std::string_view uri, const Limits& limits = {});
 
+// Decodes PNG, JPEG, WebP, GIF or BMP bytes directly to unresized RGB [height, width, 3] (Pillow RGB semantics,
+// no 40x40 tile reduction or checkerboard compositing). Used by multimodal encoders such as EmbeddingGemma 2.
+[[nodiscard]] Image decode_raw_rgb(std::span<const std::uint8_t> bytes, const Limits& limits = {});
+[[nodiscard]] Image decode_raw_rgb_data_uri(std::string_view uri, const Limits& limits = {});
+
 // Area-average reduction of [height, width, 3] bytes to [out_height, out_width, 3].
 [[nodiscard]] std::vector<std::uint8_t> reduce(std::span<const std::uint8_t> rgb, int height, int width,
                                                int out_height, int out_width);
+
+// Separable Catmull-Rom bicubic (a = -0.5) antialiased resize matching PIL.Image.Resampling.BICUBIC /
+// torchvision.transforms.v2.functional.resize(..., BICUBIC, antialias=True). Supports both downscaling & upscaling.
+[[nodiscard]] std::vector<std::uint8_t> resize_bicubic_antialias(std::span<const std::uint8_t> rgb, int height,
+                                                                 int width, int out_height, int out_width);
 
 [[nodiscard]] std::uint64_t hash_pixels(int width, int height, std::span<const std::uint8_t> rgb);
 

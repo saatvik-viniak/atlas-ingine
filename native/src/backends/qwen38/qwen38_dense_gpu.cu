@@ -321,6 +321,15 @@ struct Qwen38DenseBackend::Impl {
   std::vector<std::int32_t> decode_single_tok;
 
   std::unique_ptr<Qwen38DenseSession> default_session;
+  std::shared_ptr<const ingine::PlatosKeyGpu> platos_key_gpu;
+  // Lazily allocated single-layer ephemeral scratch for zero-KV batched /v1/embeddings (never touches default_session).
+  DevBuf<float> embed_conv_tmp;
+  DevBuf<float> embed_rec_tmp;
+  DevBuf<__nv_bfloat16> embed_k_tmp;
+  DevBuf<__nv_bfloat16> embed_v_tmp;
+  DevBuf<std::int32_t> embed_offsets_dev;
+  DevBuf<float> embed_pooled_dev;
+  DevBuf<float> embed_proj_dev;
   std::uint64_t scratch_bytes = 0;
   std::uint64_t max_state_bytes = 0;
   ingine::model::SessionLookupResult last_lookup;
@@ -1436,6 +1445,12 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
   impl_->default_session.reset(new Qwen38DenseSession(*this));
   impl_->max_state_bytes = impl_->default_session->state_bytes();
 
+  if (!options.platos_key.empty()) {
+    impl_->platos_key_gpu =
+        ingine::PlatosKeyGpu::load(options.platos_key, options.platos_key_metadata, c.hidden_size, impl_->ctx.stream);
+    impl_->platos_key_gpu->key()->validate_binding(model_id(), model_family(), c.hidden_size, c.num_hidden_layers);
+  }
+
   std::size_t vram_free_after = 0;
   CUDA_CHECK(cudaMemGetInfo(&vram_free_after, &vram_total));
 
@@ -2010,6 +2025,376 @@ ingine::model::GenerateStats Qwen38DenseBackend::warm_start(const ingine::model:
   return stats;
 }
 
+bool Qwen38DenseBackend::has_platos_key() const { return impl_->platos_key_gpu != nullptr; }
+
+int Qwen38DenseBackend::platos_key_out_dim() const {
+  return impl_->platos_key_gpu ? impl_->platos_key_gpu->out_dim() : 0;
+}
+
+std::string Qwen38DenseBackend::platos_key_tap_spec() const {
+  return impl_->platos_key_gpu ? impl_->platos_key_gpu->metadata().tap_spec : "";
+}
+
+std::shared_ptr<const PlatosKey> Qwen38DenseBackend::platos_key() const {
+  return impl_->platos_key_gpu ? impl_->platos_key_gpu->key() : nullptr;
+}
+
+ingine::model::EmbeddingResult Qwen38DenseBackend::embed(const ingine::model::EmbeddingRequest& req) {
+  impl_->ctx.bind_to_current_thread();
+  const auto& c = impl_->manifest.config;
+  const int H = c.hidden_size;
+  const int I = c.intermediate_size;
+  const int V = c.vocab_size;
+  const int P = impl_->opts.prefill_chunk;
+  const int num_layers = static_cast<int>(impl_->layers.size());
+
+  if (req.inputs.empty()) throw std::invalid_argument("embed: inputs must not be empty");
+  if (req.tap_layer.has_value() && (*req.tap_layer < 0 || *req.tap_layer >= num_layers)) {
+    throw std::invalid_argument("embed: tap_layer " + std::to_string(*req.tap_layer) + " out of range [0, " +
+                                std::to_string(num_layers - 1) + "]");
+  }
+  if (req.use_platos_key && !impl_->platos_key_gpu) {
+    throw std::invalid_argument("embed: platos_key requested but server was started without --platos-key");
+  }
+  if (req.use_platos_key) {
+    impl_->platos_key_gpu->key()->validate_request_tap(req.tap_layer);
+    impl_->platos_key_gpu->key()->validate_request_identity(req.cartridge_id.value_or(""),
+                                                           req.cartridge_sha256.value_or(""));
+  }
+
+  const int total_seqs = static_cast<int>(req.inputs.size());
+  int total_tokens = 0;
+  for (int i = 0; i < total_seqs; ++i) {
+    const auto& seq = req.inputs[static_cast<std::size_t>(i)];
+    if (seq.empty()) throw std::invalid_argument("embed: input sequence must not be empty");
+    if (static_cast<int>(seq.size()) > impl_->opts.max_ctx) {
+      throw std::invalid_argument("embed: input sequence length " + std::to_string(seq.size()) +
+                                  " exceeds max_model_len " + std::to_string(impl_->opts.max_ctx));
+    }
+    for (std::int32_t tid : seq) {
+      if (tid < 0 || tid >= V) {
+        throw std::out_of_range("embed: token id " + std::to_string(tid) + " out of vocab range [0, " +
+                                std::to_string(V) + ")");
+      }
+    }
+    total_tokens += static_cast<int>(seq.size());
+  }
+
+  // Allocate tiny single-layer ephemeral scratch on first embed() call (reused across all 64 layers; ~4.2 MB total).
+  const int cd = c.linear_conv_dim();
+  const int nhv = c.linear_num_value_heads;
+  const int nkh = c.linear_num_key_heads;
+  const int k_dim = c.linear_key_head_dim;
+  const int v_dim = c.linear_value_head_dim;
+  const int vd = c.linear_value_dim();
+  const int qg_dim = c.full_q_proj_out_dim();
+  const int kv_dim = c.full_kv_proj_out_dim();
+  const int attn_dim = c.num_attention_heads * c.head_dim;
+
+  const std::size_t conv_elems = static_cast<std::size_t>(cd) * static_cast<std::size_t>(c.linear_conv_kernel_dim);
+  const std::size_t rec_elems = static_cast<std::size_t>(nhv) * static_cast<std::size_t>(k_dim) *
+                                static_cast<std::size_t>(v_dim);
+  const std::size_t kv_tmp_elems = static_cast<std::size_t>(P) * static_cast<std::size_t>(kv_dim);
+  if (impl_->embed_conv_tmp.count < conv_elems) impl_->embed_conv_tmp.allocate(conv_elems);
+  if (impl_->embed_rec_tmp.count < rec_elems) impl_->embed_rec_tmp.allocate(rec_elems);
+  if (impl_->embed_k_tmp.count < kv_tmp_elems) impl_->embed_k_tmp.allocate(kv_tmp_elems);
+  if (impl_->embed_v_tmp.count < kv_tmp_elems) impl_->embed_v_tmp.allocate(kv_tmp_elems);
+
+  const int out_dim = req.use_platos_key ? impl_->platos_key_gpu->out_dim() : H;
+  if (impl_->embed_offsets_dev.count < static_cast<std::size_t>(total_seqs + 1)) {
+    impl_->embed_offsets_dev.allocate(static_cast<std::size_t>(total_seqs + 1));
+  }
+  const std::size_t need_pool = static_cast<std::size_t>(total_seqs) * static_cast<std::size_t>(H);
+  if (impl_->embed_pooled_dev.count < need_pool) impl_->embed_pooled_dev.allocate(need_pool);
+  if (req.use_platos_key) {
+    const std::size_t need_proj = static_cast<std::size_t>(total_seqs) * static_cast<std::size_t>(out_dim);
+    if (impl_->embed_proj_dev.count < need_proj) impl_->embed_proj_dev.allocate(need_proj);
+  }
+
+  const int stop_layer = req.tap_layer.value_or(num_layers - 1);
+  const bool apply_final_norm = !req.tap_layer.has_value();
+  const bool pool_norm_now = req.normalize && !req.use_platos_key;
+
+  const auto t_prefill_start = std::chrono::steady_clock::now();
+
+  std::vector<std::int32_t> packed_toks;
+  std::vector<int> packed_lens;
+  std::vector<std::int32_t> packed_offsets;
+  packed_toks.reserve(static_cast<std::size_t>(P));
+
+  int idx = 0;
+  while (idx < total_seqs) {
+    const int seq_len = static_cast<int>(req.inputs[static_cast<std::size_t>(idx)].size());
+    if (seq_len <= P) {
+      packed_toks.clear();
+      packed_lens.clear();
+      packed_offsets.clear();
+      packed_offsets.push_back(0);
+      const int batch_start = idx;
+      int packed_T = 0;
+      while (idx < total_seqs) {
+        const auto& seq = req.inputs[static_cast<std::size_t>(idx)];
+        const int L = static_cast<int>(seq.size());
+        if (L > P || (packed_T > 0 && packed_T + L > P)) break;
+        packed_toks.insert(packed_toks.end(), seq.begin(), seq.end());
+        packed_lens.push_back(L);
+        packed_T += L;
+        packed_offsets.push_back(packed_T);
+        ++idx;
+      }
+
+      const int pack_b = static_cast<int>(packed_lens.size());
+      CUDA_CHECK(cudaMemcpyAsync(impl_->token_ids_dev.ptr, packed_toks.data(),
+                                 packed_toks.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                 impl_->ctx.stream));
+      CUDA_CHECK(cudaMemcpyAsync(impl_->embed_offsets_dev.ptr, packed_offsets.data(),
+                                 packed_offsets.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                 impl_->ctx.stream));
+
+      if (impl_->embed_quant == Qwen38LinearQuantKind::Fp8E4M3) {
+        qwen38_cuda_embed_lookup_fp8_f32(impl_->embed_u8, impl_->embed_scale, impl_->token_ids_dev.ptr, packed_T, H, V,
+                                         impl_->hidden.ptr, impl_->ctx.stream);
+      } else if (impl_->embed_quant == Qwen38LinearQuantKind::Nvfp4) {
+        qwen38_cuda_embed_lookup_nvfp4_f32(impl_->embed_u8, impl_->embed_scales, impl_->embed_scale,
+                                           impl_->token_ids_dev.ptr, packed_T, H, V, impl_->hidden.ptr,
+                                           impl_->ctx.stream);
+      } else {
+        qwen38_cuda_embed_lookup_f32(impl_->embed_tokens, impl_->token_ids_dev.ptr, packed_T, H, V, impl_->hidden.ptr,
+                                     impl_->ctx.stream);
+      }
+
+      for (int li = 0; li <= stop_layer; ++li) {
+        const auto& l = impl_->layers[static_cast<std::size_t>(li)];
+        qwen38_cuda_rmsnorm_zero_centered_f32(impl_->hidden.ptr, l.input_layernorm, c.rms_norm_eps, packed_T, H,
+                                              impl_->normed.ptr, impl_->ctx.stream);
+        if (l.kind == Qwen38LayerKind::LinearAttention) {
+          // Packed compute-bound GEMMs across all packed_T tokens, then sequence-isolated zero-state conv+GDN.
+          impl_->proj_forward_f32(l.in_proj_qkv, impl_->normed.ptr, packed_T, impl_->qkv.ptr);
+          impl_->proj_forward_f32(l.in_proj_z, impl_->normed.ptr, packed_T, impl_->z_buf.ptr);
+          impl_->proj_forward_f32(l.in_proj_a, impl_->normed.ptr, packed_T, impl_->a_buf.ptr);
+          impl_->proj_forward_f32(l.in_proj_b, impl_->normed.ptr, packed_T, impl_->b_buf.ptr);
+
+          int off = 0;
+          for (int b = 0; b < pack_b; ++b) {
+            const int L = packed_lens[static_cast<std::size_t>(b)];
+            CUDA_CHECK(cudaMemsetAsync(impl_->embed_conv_tmp.ptr, 0, conv_elems * sizeof(float), impl_->ctx.stream));
+            CUDA_CHECK(cudaMemsetAsync(impl_->embed_rec_tmp.ptr, 0, rec_elems * sizeof(float), impl_->ctx.stream));
+            qwen38_cuda_causal_conv1d_silu_prefill_f32(
+                impl_->qkv.ptr + static_cast<std::size_t>(off) * cd, l.conv1d_weight, L, cd, c.linear_conv_kernel_dim,
+                impl_->embed_conv_tmp.ptr, impl_->conv_out.ptr + static_cast<std::size_t>(off) * cd, impl_->ctx.stream);
+            qwen38_cuda_gdn_recurrent_prefill_f32(
+                impl_->conv_out.ptr + static_cast<std::size_t>(off) * cd,
+                impl_->z_buf.ptr + static_cast<std::size_t>(off) * vd,
+                impl_->a_buf.ptr + static_cast<std::size_t>(off) * nhv,
+                impl_->b_buf.ptr + static_cast<std::size_t>(off) * nhv, l.a_log, l.dt_bias, l.linear_norm_weight,
+                c.rms_norm_eps, L, nkh, nhv, k_dim, v_dim, impl_->embed_rec_tmp.ptr, impl_->gdn_scratch.ptr,
+                impl_->core_out.ptr + static_cast<std::size_t>(off) * vd, impl_->ctx.stream);
+            off += L;
+          }
+          impl_->proj_forward_f32(l.out_proj, impl_->core_out.ptr, packed_T, impl_->residual.ptr);
+        } else {
+          // Packed QKV GEMMs across all packed_T tokens, then sequence-isolated causal attention into ephemeral KV tmp.
+          impl_->proj_forward_f32(l.q_proj, impl_->normed.ptr, packed_T, impl_->q_gate.ptr);
+          impl_->proj_forward_f32(l.k_proj, impl_->normed.ptr, packed_T, impl_->k_raw.ptr);
+          impl_->proj_forward_f32(l.v_proj, impl_->normed.ptr, packed_T, impl_->v_raw.ptr);
+
+          int off = 0;
+          for (int b = 0; b < pack_b; ++b) {
+            const int L = packed_lens[static_cast<std::size_t>(b)];
+            qwen38_cuda_full_attn_gated_f32_kvbf16(
+                impl_->q_gate.ptr + static_cast<std::size_t>(off) * qg_dim,
+                impl_->k_raw.ptr + static_cast<std::size_t>(off) * kv_dim,
+                impl_->v_raw.ptr + static_cast<std::size_t>(off) * kv_dim, l.q_norm, l.k_norm, c.rms_norm_eps,
+                c.rope_theta, L, /*pos_offset=*/0, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+                c.rotary_dim, impl_->embed_k_tmp.ptr, impl_->embed_v_tmp.ptr, P,
+                impl_->q_tmp.ptr + static_cast<std::size_t>(off) * attn_dim,
+                impl_->gate_tmp.ptr + static_cast<std::size_t>(off) * attn_dim,
+                impl_->attn_out.ptr + static_cast<std::size_t>(off) * attn_dim, impl_->ctx.stream,
+                impl_->attn_split_scratch.ptr, impl_->attn_split_scratch.count, impl_->opts.use_fast_attn);
+            off += L;
+          }
+          impl_->proj_forward_f32(l.o_proj, impl_->attn_out.ptr, packed_T, impl_->residual.ptr);
+        }
+
+        qwen38_cuda_add_residual_f32(impl_->hidden.ptr, impl_->residual.ptr,
+                                     static_cast<std::size_t>(packed_T) * static_cast<std::size_t>(H),
+                                     impl_->ctx.stream);
+        qwen38_cuda_rmsnorm_zero_centered_f32(impl_->hidden.ptr, l.post_attention_layernorm, c.rms_norm_eps, packed_T,
+                                              H, impl_->normed.ptr, impl_->ctx.stream);
+        impl_->proj_forward_f32(l.gate_proj, impl_->normed.ptr, packed_T, impl_->mlp_gate.ptr);
+        impl_->proj_forward_f32(l.up_proj, impl_->normed.ptr, packed_T, impl_->mlp_up.ptr);
+        qwen38_cuda_swiglu_mul_f32(impl_->mlp_gate.ptr, impl_->mlp_up.ptr, impl_->mlp_gate.ptr,
+                                   static_cast<std::size_t>(packed_T) * static_cast<std::size_t>(I),
+                                   impl_->ctx.stream);
+        impl_->proj_forward_f32(l.down_proj, impl_->mlp_gate.ptr, packed_T, impl_->residual.ptr);
+        qwen38_cuda_add_residual_f32(impl_->hidden.ptr, impl_->residual.ptr,
+                                     static_cast<std::size_t>(packed_T) * static_cast<std::size_t>(H),
+                                     impl_->ctx.stream);
+      }
+
+      const float* pool_src = impl_->hidden.ptr;
+      if (apply_final_norm) {
+        qwen38_cuda_rmsnorm_zero_centered_f32(impl_->hidden.ptr, impl_->final_norm, c.rms_norm_eps, packed_T, H,
+                                              impl_->normed.ptr, impl_->ctx.stream);
+        pool_src = impl_->normed.ptr;
+      }
+      // Completely skip lm_head GEMM! Pool directly into embed_pooled_dev.
+      float* dst = impl_->embed_pooled_dev.ptr + static_cast<std::size_t>(batch_start) * static_cast<std::size_t>(H);
+      ingine::embed_pool_f32_cuda(pool_src, impl_->embed_offsets_dev.ptr, pack_b, H, static_cast<int>(req.pooling),
+                                  pool_norm_now, dst, impl_->ctx.stream);
+    } else {
+      // Transient chunked fallback for a single long input > prefill_chunk (never mutates default_session).
+      const auto& seq = req.inputs[static_cast<std::size_t>(idx)];
+      const int L = static_cast<int>(seq.size());
+      Qwen38DenseSession tmp_sess(*this, /*max_checkpoints=*/0);
+      std::vector<double> mean_acc(static_cast<std::size_t>(H), 0.0);
+      std::vector<float> seq_out(static_cast<std::size_t>(H), 0.0f);
+      std::vector<float> host_chunk;
+      for (int off = 0; off < L; off += P) {
+        const int M = std::min(P, L - off);
+        CUDA_CHECK(cudaMemcpyAsync(impl_->token_ids_dev.ptr, seq.data() + off,
+                                   static_cast<std::size_t>(M) * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                   impl_->ctx.stream));
+        if (impl_->embed_quant == Qwen38LinearQuantKind::Fp8E4M3) {
+          qwen38_cuda_embed_lookup_fp8_f32(impl_->embed_u8, impl_->embed_scale, impl_->token_ids_dev.ptr, M, H, V,
+                                           impl_->hidden.ptr, impl_->ctx.stream);
+        } else if (impl_->embed_quant == Qwen38LinearQuantKind::Nvfp4) {
+          qwen38_cuda_embed_lookup_nvfp4_f32(impl_->embed_u8, impl_->embed_scales, impl_->embed_scale,
+                                             impl_->token_ids_dev.ptr, M, H, V, impl_->hidden.ptr, impl_->ctx.stream);
+        } else {
+          qwen38_cuda_embed_lookup_f32(impl_->embed_tokens, impl_->token_ids_dev.ptr, M, H, V, impl_->hidden.ptr,
+                                       impl_->ctx.stream);
+        }
+        std::size_t lin_idx = 0;
+        std::size_t full_idx = 0;
+        for (int li = 0; li <= stop_layer; ++li) {
+          const auto& l = impl_->layers[static_cast<std::size_t>(li)];
+          qwen38_cuda_rmsnorm_zero_centered_f32(impl_->hidden.ptr, l.input_layernorm, c.rms_norm_eps, M, H,
+                                                impl_->normed.ptr, impl_->ctx.stream);
+          if (l.kind == Qwen38LayerKind::LinearAttention) {
+            impl_->proj_forward_f32(l.in_proj_qkv, impl_->normed.ptr, M, impl_->qkv.ptr);
+            impl_->proj_forward_f32(l.in_proj_z, impl_->normed.ptr, M, impl_->z_buf.ptr);
+            impl_->proj_forward_f32(l.in_proj_a, impl_->normed.ptr, M, impl_->a_buf.ptr);
+            impl_->proj_forward_f32(l.in_proj_b, impl_->normed.ptr, M, impl_->b_buf.ptr);
+            qwen38_cuda_causal_conv1d_silu_prefill_f32(impl_->qkv.ptr, l.conv1d_weight, M, cd,
+                                                       c.linear_conv_kernel_dim,
+                                                       tmp_sess.state_->conv_states[lin_idx].ptr, impl_->conv_out.ptr,
+                                                       impl_->ctx.stream);
+            qwen38_cuda_gdn_recurrent_prefill_f32(impl_->conv_out.ptr, impl_->z_buf.ptr, impl_->a_buf.ptr,
+                                                  impl_->b_buf.ptr, l.a_log, l.dt_bias, l.linear_norm_weight,
+                                                  c.rms_norm_eps, M, nkh, nhv, k_dim, v_dim,
+                                                  tmp_sess.state_->rec_states[lin_idx].ptr, impl_->gdn_scratch.ptr,
+                                                  impl_->core_out.ptr, impl_->ctx.stream);
+            impl_->proj_forward_f32(l.out_proj, impl_->core_out.ptr, M, impl_->residual.ptr);
+            ++lin_idx;
+          } else {
+            impl_->proj_forward_f32(l.q_proj, impl_->normed.ptr, M, impl_->q_gate.ptr);
+            impl_->proj_forward_f32(l.k_proj, impl_->normed.ptr, M, impl_->k_raw.ptr);
+            impl_->proj_forward_f32(l.v_proj, impl_->normed.ptr, M, impl_->v_raw.ptr);
+            qwen38_cuda_full_attn_gated_f32_kvbf16(
+                impl_->q_gate.ptr, impl_->k_raw.ptr, impl_->v_raw.ptr, l.q_norm, l.k_norm, c.rms_norm_eps, c.rope_theta,
+                M, off, c.num_attention_heads, c.num_key_value_heads, c.head_dim, c.rotary_dim,
+                tmp_sess.state_->k_caches[full_idx].ptr, tmp_sess.state_->v_caches[full_idx].ptr, impl_->opts.max_ctx,
+                impl_->q_tmp.ptr, impl_->gate_tmp.ptr, impl_->attn_out.ptr, impl_->ctx.stream,
+                impl_->attn_split_scratch.ptr, impl_->attn_split_scratch.count, impl_->opts.use_fast_attn);
+            impl_->proj_forward_f32(l.o_proj, impl_->attn_out.ptr, M, impl_->residual.ptr);
+            ++full_idx;
+          }
+          qwen38_cuda_add_residual_f32(impl_->hidden.ptr, impl_->residual.ptr,
+                                       static_cast<std::size_t>(M) * static_cast<std::size_t>(H), impl_->ctx.stream);
+          qwen38_cuda_rmsnorm_zero_centered_f32(impl_->hidden.ptr, l.post_attention_layernorm, c.rms_norm_eps, M, H,
+                                                impl_->normed.ptr, impl_->ctx.stream);
+          impl_->proj_forward_f32(l.gate_proj, impl_->normed.ptr, M, impl_->mlp_gate.ptr);
+          impl_->proj_forward_f32(l.up_proj, impl_->normed.ptr, M, impl_->mlp_up.ptr);
+          qwen38_cuda_swiglu_mul_f32(impl_->mlp_gate.ptr, impl_->mlp_up.ptr, impl_->mlp_gate.ptr,
+                                     static_cast<std::size_t>(M) * static_cast<std::size_t>(I), impl_->ctx.stream);
+          impl_->proj_forward_f32(l.down_proj, impl_->mlp_gate.ptr, M, impl_->residual.ptr);
+          qwen38_cuda_add_residual_f32(impl_->hidden.ptr, impl_->residual.ptr,
+                                       static_cast<std::size_t>(M) * static_cast<std::size_t>(H), impl_->ctx.stream);
+        }
+        const bool need_chunk =
+            (req.pooling == ingine::model::EmbeddingPooling::Mean) ||
+            (req.pooling == ingine::model::EmbeddingPooling::Cls && off == 0) ||
+            (req.pooling == ingine::model::EmbeddingPooling::LastToken && off + M == L);
+        if (!need_chunk) continue;
+        const float* src = impl_->hidden.ptr;
+        if (apply_final_norm) {
+          qwen38_cuda_rmsnorm_zero_centered_f32(impl_->hidden.ptr, impl_->final_norm, c.rms_norm_eps, M, H,
+                                                impl_->normed.ptr, impl_->ctx.stream);
+          src = impl_->normed.ptr;
+        }
+        host_chunk.resize(static_cast<std::size_t>(M) * static_cast<std::size_t>(H));
+        CUDA_CHECK(cudaMemcpyAsync(host_chunk.data(), src, host_chunk.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                                   impl_->ctx.stream));
+        impl_->ctx.synchronize();
+        if (req.pooling == ingine::model::EmbeddingPooling::Cls) {
+          std::memcpy(seq_out.data(), host_chunk.data(), static_cast<std::size_t>(H) * sizeof(float));
+        } else if (req.pooling == ingine::model::EmbeddingPooling::LastToken) {
+          std::memcpy(seq_out.data(), host_chunk.data() + static_cast<std::size_t>(M - 1) * static_cast<std::size_t>(H),
+                      static_cast<std::size_t>(H) * sizeof(float));
+        } else {
+          for (int t = 0; t < M; ++t) {
+            const std::size_t base = static_cast<std::size_t>(t) * static_cast<std::size_t>(H);
+            for (int d = 0; d < H; ++d) mean_acc[static_cast<std::size_t>(d)] += host_chunk[base + d];
+          }
+        }
+      }
+      if (req.pooling == ingine::model::EmbeddingPooling::Mean) {
+        const double inv = 1.0 / static_cast<double>(L);
+        for (int d = 0; d < H; ++d) seq_out[static_cast<std::size_t>(d)] = static_cast<float>(mean_acc[d] * inv);
+      }
+      if (pool_norm_now) ingine::l2_normalize_rows_cpu(seq_out.data(), 1, H);
+      float* dst = impl_->embed_pooled_dev.ptr + static_cast<std::size_t>(idx) * static_cast<std::size_t>(H);
+      CUDA_CHECK(cudaMemcpyAsync(dst, seq_out.data(), static_cast<std::size_t>(H) * sizeof(float),
+                                 cudaMemcpyHostToDevice, impl_->ctx.stream));
+      impl_->ctx.synchronize();
+      ++idx;
+    }
+  }
+  impl_->ctx.synchronize();
+  const double prefill_sec =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t_prefill_start).count();
+
+  double platos_sec = 0.0;
+  const float* final_dev = impl_->embed_pooled_dev.ptr;
+  if (req.use_platos_key) {
+    cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+    CUDA_CHECK(cudaEventCreate(&ev0));
+    CUDA_CHECK(cudaEventCreate(&ev1));
+    CUDA_CHECK(cudaEventRecord(ev0, impl_->ctx.stream));
+    impl_->platos_key_gpu->project(impl_->embed_pooled_dev.ptr, total_seqs, impl_->embed_proj_dev.ptr, req.normalize,
+                                   impl_->ctx.stream);
+    CUDA_CHECK(cudaEventRecord(ev1, impl_->ctx.stream));
+    CUDA_CHECK(cudaEventSynchronize(ev1));
+    float pk_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&pk_ms, ev0, ev1));
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    platos_sec = static_cast<double>(pk_ms) * 1e-3;
+    final_dev = impl_->embed_proj_dev.ptr;
+  }
+
+  std::vector<float> flat(static_cast<std::size_t>(total_seqs) * static_cast<std::size_t>(out_dim));
+  CUDA_CHECK(cudaMemcpyAsync(flat.data(), final_dev, flat.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                             impl_->ctx.stream));
+  impl_->ctx.synchronize();
+
+  ingine::model::EmbeddingResult res;
+  res.embeddings.resize(static_cast<std::size_t>(total_seqs));
+  for (int b = 0; b < total_seqs; ++b) {
+    const float* row = flat.data() + static_cast<std::size_t>(b) * static_cast<std::size_t>(out_dim);
+    res.embeddings[static_cast<std::size_t>(b)].assign(row, row + out_dim);
+  }
+  res.stats.total_prompt_tokens = total_tokens;
+  res.stats.prefill_seconds = prefill_sec;
+  res.stats.platos_key_seconds = platos_sec;
+  res.stats.effective_tap_layer = req.tap_layer.value_or(-1);
+  res.stats.output_dim = out_dim;
+  res.stats.kv_slots_allocated = 0;
+  res.stats.lm_head_skipped = true;
+  return res;
+}
+
 void register_qwen38_cuda_backend() {
   static std::once_flag once;
   std::call_once(once, []() {
@@ -2027,6 +2412,8 @@ void register_qwen38_cuda_backend() {
           load_opts.verify_pins = plan.verify_pins;
           load_opts.use_calibrated_fp8 = plan.use_calibrated_fp8;
           load_opts.prefix_cache = plan.prefix_cache;
+          load_opts.platos_key = plan.normalized_options.platos_key;
+          load_opts.platos_key_metadata = plan.normalized_options.platos_key_metadata;
           if (const char* env_ps = std::getenv("INGINE_QWEN38_PRE_SUFFIX_CKPT"); env_ps && env_ps[0] == '0') {
             load_opts.pre_suffix_checkpoint = false;
           }

@@ -1,9 +1,12 @@
 #include "serve/openai.h"
 
+#include "backends/embedding_gemma2/eg2_audio.h"
+
 #include <algorithm>
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <span>
@@ -612,5 +615,626 @@ Json delta_json(const text::Delta& d) {
 }
 
 std::string dump(const Json& value) { return value.dump(-1, ' ', false, Json::error_handler_t::replace); }
+
+ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
+                                               int num_tap_layers, bool has_platos_key) {
+  EmbeddingParseOptions opts;
+  opts.max_model_len = max_model_len;
+  opts.num_tap_layers = num_tap_layers;
+  opts.has_platos_key = has_platos_key;
+  return parse_embedding_request(body, fmt, opts);
+}
+
+ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
+                                               int num_tap_layers, const PlatosKey* loaded_platos_key) {
+  EmbeddingParseOptions opts;
+  opts.max_model_len = max_model_len;
+  opts.num_tap_layers = num_tap_layers;
+  opts.has_platos_key = (loaded_platos_key != nullptr);
+  opts.loaded_platos_key = loaded_platos_key;
+  return parse_embedding_request(body, fmt, opts);
+}
+
+ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt,
+                                               const EmbeddingParseOptions& opts) {
+  ParsedEmbeddingRequest out;
+
+  if (const Json* m = get(body, "model")) {
+    if (!m->is_string()) throw BadRequest("'model' must be a string", "model");
+  }
+
+  std::string prompt_prefix;
+  if (const Json* pn = get(body, "prompt_name")) {
+    if (!pn->is_string()) throw BadRequest("'prompt_name' must be a string", "prompt_name");
+    const std::string& name = pn->get_ref<const std::string&>();
+    if (name.empty()) throw BadRequest("'prompt_name' must not be empty", "prompt_name");
+    const auto it = opts.prompt_prefixes.find(name);
+    if (it == opts.prompt_prefixes.end()) {
+      throw BadRequest("unknown 'prompt_name': '" + name + "'", "prompt_name");
+    }
+    prompt_prefix = it->second;
+    out.request.prompt_name = name;
+  }
+
+  const Json* inp = get(body, "input");
+  if (!inp) throw BadRequest("'input' is required", "input");
+
+  const bool wrap_bos_eos = (fmt.kind() == text::ChatFormatKind::EmbeddingGemma2);
+
+  // Extracts an exact integer from JSON `v` without silent narrowing or saturation.
+  // Rejects booleans, non-numbers, non-integral/non-finite floats, and values outside [min_val, max_val].
+  auto parse_json_int_in_range = [](const Json& v, int min_val, int max_val, const char* param,
+                                    const std::string& field_desc) -> int {
+    if (v.is_boolean() || !v.is_number()) {
+      throw BadRequest(field_desc + " must be an integer", param);
+    }
+    if (v.is_number_unsigned()) {
+      const std::uint64_t u = v.get<std::uint64_t>();
+      if (max_val < 0 || u > static_cast<std::uint64_t>(max_val) ||
+          (min_val > 0 && u < static_cast<std::uint64_t>(min_val))) {
+        throw BadRequest(field_desc + " value " + std::to_string(u) + " is outside valid integer range [" +
+                             std::to_string(min_val) + ", " + std::to_string(max_val) + "]",
+                         param);
+      }
+      return static_cast<int>(u);
+    }
+    if (v.is_number_integer()) {
+      const std::int64_t s = v.get<std::int64_t>();
+      if (s < static_cast<std::int64_t>(min_val) || s > static_cast<std::int64_t>(max_val)) {
+        throw BadRequest(field_desc + " value " + std::to_string(s) + " is outside valid integer range [" +
+                             std::to_string(min_val) + ", " + std::to_string(max_val) + "]",
+                         param);
+      }
+      return static_cast<int>(s);
+    }
+    const double d = v.get<double>();
+    if (!std::isfinite(d) || std::trunc(d) != d) {
+      throw BadRequest(field_desc + " must be an integer", param);
+    }
+    if (d < static_cast<double>(min_val) || d > static_cast<double>(max_val)) {
+      throw BadRequest(field_desc + " value is outside valid integer range [" + std::to_string(min_val) + ", " +
+                           std::to_string(max_val) + "]",
+                       param);
+    }
+    return static_cast<int>(static_cast<std::int64_t>(d));
+  };
+
+  auto parse_max_soft_tokens = [](const Json& mst, const std::string& where_desc) -> int {
+    if (mst.is_boolean() || !mst.is_number_integer()) {
+      throw BadRequest(where_desc + " 'max_soft_tokens' must be an integer", "input");
+    }
+    int val = 0;
+    if (mst.is_number_unsigned()) {
+      const std::uint64_t u = mst.get<std::uint64_t>();
+      if (u > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+        throw BadRequest(where_desc + " 'max_soft_tokens' value " + std::to_string(u) +
+                             " exceeds valid integer range",
+                         "input");
+      }
+      val = static_cast<int>(u);
+    } else {
+      const std::int64_t s = mst.get<std::int64_t>();
+      if (s < 0 || s > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
+        throw BadRequest(where_desc + " 'max_soft_tokens' value " + std::to_string(s) +
+                             " is outside valid integer range",
+                         "input");
+      }
+      val = static_cast<int>(s);
+    }
+    if (val != 70 && val != 140 && val != 280 && val != 560 && val != 1120) {
+      throw BadRequest("'max_soft_tokens' must be one of [70, 140, 280, 560, 1120]", "input");
+    }
+    return val;
+  };
+
+  auto eg2_num_soft_tokens = [](int h, int w, int max_st) -> int {
+    if (max_st != 70 && max_st != 140 && max_st != 280 && max_st != 560 && max_st != 1120) {
+      throw BadRequest("'max_soft_tokens' must be one of [70, 140, 280, 560, 1120]", "input");
+    }
+    constexpr int patch_size = 16;
+    constexpr int pool_k = 3;
+    constexpr int k2 = pool_k * pool_k;
+    constexpr int side_mult = patch_size * pool_k;
+    const int max_patches = max_st * k2;
+    const double factor = std::sqrt(static_cast<double>(max_patches * patch_size * patch_size) /
+                                    (static_cast<double>(h) * static_cast<double>(w)));
+    int th = static_cast<int>(std::floor(factor * static_cast<double>(h) / side_mult)) * side_mult;
+    int tw = static_cast<int>(std::floor(factor * static_cast<double>(w) / side_mult)) * side_mult;
+    if (th == 0 && tw == 0) throw BadRequest("image dimensions collapse to 0x0 after aspect-ratio resize", "input");
+    const int max_side = max_st * side_mult;
+    if (th == 0) {
+      th = side_mult;
+      tw = std::max(side_mult, std::min(static_cast<int>(std::floor(static_cast<double>(w) / h)) * side_mult, max_side));
+    } else if (tw == 0) {
+      tw = side_mult;
+      th = std::max(side_mult, std::min(static_cast<int>(std::floor(static_cast<double>(h) / w)) * side_mult, max_side));
+    }
+    return (th / side_mult) * (tw / side_mult);
+  };
+
+  auto extract_uri_and_budget = [&](const Json& obj, int default_budget,
+                                    const char* where_desc) -> std::pair<std::string, int> {
+    int budget = default_budget;
+    if (const Json* mst = get(obj, "max_soft_tokens")) {
+      budget = parse_max_soft_tokens(*mst, where_desc);
+    }
+    if (const Json* iu = get(obj, "image_url")) {
+      if (iu->is_string()) return {iu->get<std::string>(), budget};
+      if (iu->is_object()) {
+        if (const Json* mst2 = get(*iu, "max_soft_tokens")) {
+          budget = parse_max_soft_tokens(*mst2, where_desc);
+        }
+        if (const Json* u = get(*iu, "url"); u && u->is_string()) return {u->get<std::string>(), budget};
+      }
+      throw BadRequest(std::string(where_desc) + " 'image_url' must be a data: URI string or {\"url\": ...}", "input");
+    }
+    if (const Json* u = get(obj, "url"); u && u->is_string()) return {u->get<std::string>(), budget};
+    if (const Json* im = get(obj, "image"); im && im->is_string()) return {im->get<std::string>(), budget};
+    throw BadRequest(std::string(where_desc) + " missing image data URI ('image_url' or 'url')", "input");
+  };
+
+  bool any_images = false;
+  bool any_audios = false;
+  std::int64_t total_images = 0;
+  std::int64_t total_image_tokens = 0;
+  std::vector<std::vector<model::EmbeddingImage>> per_item_images;
+  std::vector<std::vector<model::EmbeddingAudio>> per_item_audios;
+
+  auto reserve_image_slots = [&](std::size_t add_count) {
+    if (opts.max_images < 0) {
+      total_images += static_cast<std::int64_t>(add_count);
+      return;
+    }
+    const std::uint64_t max_u = static_cast<std::uint64_t>(opts.max_images);
+    const std::uint64_t cur_u = static_cast<std::uint64_t>(total_images);
+    if (add_count > max_u || cur_u > max_u - add_count) {
+      const std::uint64_t attempted =
+          (add_count <= std::numeric_limits<std::uint64_t>::max() - cur_u) ? (cur_u + add_count) : max_u + 1;
+      throw BadRequest("the request has " + std::to_string(attempted) + " images/video frames; at most " +
+                           std::to_string(opts.max_images) + " are accepted",
+                       "input");
+    }
+    total_images += static_cast<std::int64_t>(add_count);
+  };
+
+  auto add_image_tokens = [&](int n_soft) {
+    total_image_tokens += static_cast<std::int64_t>(n_soft);
+    if (opts.max_total_tokens >= 0 && total_image_tokens > static_cast<std::int64_t>(opts.max_total_tokens)) {
+      throw BadRequest("the images/video frames of the request take " + std::to_string(total_image_tokens) +
+                           " tokens; at most " + std::to_string(opts.max_total_tokens) + " are accepted",
+                       "input");
+    }
+  };
+
+  auto encode_text_item = [&](const std::string& text, const char* where_desc) {
+    if (text.empty()) {
+      throw BadRequest(std::string(where_desc) + " must not be empty", "input");
+    }
+    const std::string full_text = prompt_prefix.empty() ? text : (prompt_prefix + text);
+    std::vector<int32_t> ids;
+    try {
+      ids = wrap_bos_eos ? fmt.tokenizer().encode_with_post_processor(full_text, /*special=*/false)
+                         : fmt.tokenizer().encode(full_text, /*special=*/false);
+    } catch (const std::invalid_argument& e) {
+      throw BadRequest(std::string("failed to tokenize 'input': ") + e.what(), "input");
+    }
+    if (ids.empty()) {
+      throw BadRequest(std::string(where_desc) + " tokenized to 0 tokens", "input");
+    }
+    if (static_cast<int>(ids.size()) > opts.max_model_len) {
+      throw BadRequest("input has " + std::to_string(ids.size()) + " tokens; the model context is " +
+                           std::to_string(opts.max_model_len),
+                       "input");
+    }
+    out.request.inputs.push_back(std::move(ids));
+    per_item_images.emplace_back();
+    per_item_audios.emplace_back();
+  };
+
+  auto encode_parts_item = [&](const Json& parts, const char* where_desc) {
+    if (!parts.is_array() || parts.empty()) {
+      throw BadRequest(std::string(where_desc) + " content parts array must not be empty", "input");
+    }
+    std::vector<int32_t> ids;
+    std::vector<model::EmbeddingImage> item_imgs;
+    std::vector<model::EmbeddingAudio> item_auds;
+    bool has_text = false;
+    bool prefix_applied = false;
+    if (wrap_bos_eos && fmt.tokenizer().bos_token_id().has_value()) {
+      ids.push_back(*fmt.tokenizer().bos_token_id());
+    }
+
+    constexpr int32_t kBoi = 255999;
+    constexpr int32_t kBoa = 256000;
+    constexpr int32_t kImgTok = 258880;
+    constexpr int32_t kAudTok = 258881;
+    constexpr int32_t kEoi = 258882;
+    constexpr int32_t kEoa = 258883;
+    constexpr int32_t kVidTok = 258884;
+
+    for (std::size_t pi = 0; pi < parts.size(); ++pi) {
+      const Json& part = parts[pi];
+      if (!part.is_object()) {
+        throw BadRequest(std::string(where_desc) + "[" + std::to_string(pi) + "] must be an object", "input");
+      }
+      const Json* tp = get(part, "type");
+      if (!tp || !tp->is_string()) {
+        throw BadRequest(std::string(where_desc) + "[" + std::to_string(pi) + "] missing string 'type'", "input");
+      }
+      const std::string& ptype = tp->get_ref<const std::string&>();
+      if (ptype == "text" || ptype == "input_text") {
+        const Json* tv = get(part, "text");
+        if (!tv || !tv->is_string() || tv->get_ref<const std::string&>().empty()) {
+          throw BadRequest(std::string(where_desc) + "[" + std::to_string(pi) + "] 'text' must be a non-empty string",
+                           "input");
+        }
+        has_text = true;
+        std::string txt = tv->get<std::string>();
+        if (!prompt_prefix.empty() && !prefix_applied) {
+          txt = prompt_prefix + txt;
+          prefix_applied = true;
+        }
+        std::vector<int32_t> tids = fmt.tokenizer().encode(txt, /*special=*/false);
+        ids.insert(ids.end(), tids.begin(), tids.end());
+      } else if (ptype == "image_url" || ptype == "input_image" || ptype == "image") {
+        if (!opts.supports_images) {
+          throw BadRequest("image inputs are not enabled on this server (started without vision or --no-vision)",
+                           "input");
+        }
+        if (!wrap_bos_eos) {
+          throw BadRequest("multimodal image embeddings are only supported on multimodal encoder models", "input");
+        }
+        const auto [uri, budget] = extract_uri_and_budget(part, opts.vision_soft_tokens_per_image, where_desc);
+        reserve_image_slots(1);
+        image::Image decoded;
+        try {
+          decoded = image::decode_raw_rgb_data_uri(uri, opts.image_limits);
+        } catch (const image::Error& e) {
+          throw BadRequest(e.what(), "input");
+        }
+        const int n_soft = eg2_num_soft_tokens(decoded.height, decoded.width, budget);
+        add_image_tokens(n_soft);
+        ids.push_back(kBoi);
+        ids.insert(ids.end(), static_cast<std::size_t>(n_soft), kImgTok);
+        ids.push_back(kEoi);
+        model::EmbeddingImage eimg;
+        eimg.width = decoded.width;
+        eimg.height = decoded.height;
+        eimg.rgb = std::move(decoded.rgb);
+        eimg.max_soft_tokens = budget;
+        eimg.is_video_frame = false;
+        item_imgs.push_back(std::move(eimg));
+        any_images = true;
+      } else if (ptype == "video") {
+        if (!opts.supports_images) {
+          throw BadRequest("video inputs are not enabled on this server (started without vision or --no-vision)",
+                           "input");
+        }
+        if (!wrap_bos_eos) {
+          throw BadRequest("multimodal video embeddings are only supported on multimodal encoder models", "input");
+        }
+        const Json* frames = get(part, "frames");
+        if (!frames || !frames->is_array() || frames->empty()) {
+          throw BadRequest(std::string(where_desc) + "[" + std::to_string(pi) + "] 'frames' must be a non-empty array",
+                           "input");
+        }
+        int frame_budget = opts.video_soft_tokens_per_frame;
+        if (const Json* mst = get(part, "max_soft_tokens")) {
+          frame_budget = parse_max_soft_tokens(*mst, where_desc);
+        }
+        reserve_image_slots(frames->size());
+        for (std::size_t fi = 0; fi < frames->size(); ++fi) {
+          const Json& fr = (*frames)[fi];
+          std::string uri;
+          int fbudget = frame_budget;
+          if (fr.is_string()) {
+            uri = fr.get<std::string>();
+          } else if (fr.is_object()) {
+            std::tie(uri, fbudget) = extract_uri_and_budget(fr, frame_budget, where_desc);
+          } else {
+            throw BadRequest("video frame must be a data: URI string or object", "input");
+          }
+          image::Image decoded;
+          try {
+            decoded = image::decode_raw_rgb_data_uri(uri, opts.image_limits);
+          } catch (const image::Error& e) {
+            throw BadRequest(e.what(), "input");
+          }
+          const int n_soft = eg2_num_soft_tokens(decoded.height, decoded.width, fbudget);
+          add_image_tokens(n_soft);
+          ids.push_back(kBoi);
+          ids.insert(ids.end(), static_cast<std::size_t>(n_soft), kVidTok);
+          ids.push_back(kEoi);
+          model::EmbeddingImage eimg;
+          eimg.width = decoded.width;
+          eimg.height = decoded.height;
+          eimg.rgb = std::move(decoded.rgb);
+          eimg.max_soft_tokens = fbudget;
+          eimg.is_video_frame = true;
+          item_imgs.push_back(std::move(eimg));
+          any_images = true;
+        }
+      } else if (ptype == "input_audio" || ptype == "audio") {
+        if (!opts.supports_audio) {
+          throw BadRequest("audio inputs are not enabled on this server (started without audio or --no-audio)", "input");
+        }
+        if (!wrap_bos_eos) {
+          throw BadRequest("multimodal audio embeddings are only supported on multimodal encoder models", "input");
+        }
+        std::string audio_payload;
+        if (const Json* ia = get(part, "input_audio")) {
+          if (ia->is_object()) {
+            if (const Json* fmt_j = get(*ia, "format")) {
+              if (!fmt_j->is_string() || fmt_j->get_ref<const std::string&>() != "wav") {
+                throw BadRequest("audio input 'format' must be 'wav'", "input");
+              }
+            }
+            if (const Json* d = get(*ia, "data"); d && d->is_string()) {
+              audio_payload = d->get<std::string>();
+            }
+          } else if (ia->is_string()) {
+            audio_payload = ia->get<std::string>();
+          }
+        }
+        if (audio_payload.empty()) {
+          if (const Json* d = get(part, "data"); d && d->is_string()) {
+            audio_payload = d->get<std::string>();
+          } else if (const Json* au = get(part, "audio_url")) {
+            if (au->is_string()) {
+              audio_payload = au->get<std::string>();
+            } else if (au->is_object()) {
+              if (const Json* u = get(*au, "url"); u && u->is_string()) audio_payload = u->get<std::string>();
+            }
+          } else if (const Json* a = get(part, "audio"); a && a->is_string()) {
+            audio_payload = a->get<std::string>();
+          } else if (const Json* u = get(part, "url"); u && u->is_string()) {
+            audio_payload = u->get<std::string>();
+          }
+        }
+        if (audio_payload.empty()) {
+          throw BadRequest(std::string(where_desc) + "[" + std::to_string(pi) +
+                               "] missing audio payload ('input_audio.data', 'data', or 'audio_url')",
+                           "input");
+        }
+        model::EmbeddingAudio decoded_audio;
+        int n_aud_soft = 0;
+        try {
+          decoded_audio = backends::embedding_gemma2::eg2_decode_wav_base64_or_data_uri(audio_payload);
+          n_aud_soft = backends::embedding_gemma2::eg2_preprocess_audio(decoded_audio).num_valid_tokens;
+        } catch (const std::invalid_argument& e) {
+          throw BadRequest(e.what(), "input");
+        }
+        ids.push_back(kBoa);
+        ids.insert(ids.end(), static_cast<std::size_t>(n_aud_soft), kAudTok);
+        ids.push_back(kEoa);
+        item_auds.push_back(std::move(decoded_audio));
+        any_audios = true;
+      } else {
+        throw BadRequest(std::string(where_desc) + "[" + std::to_string(pi) + "] unsupported content part type '" +
+                             ptype + "'",
+                         "input");
+      }
+    }
+
+    if (!prompt_prefix.empty() && !has_text) {
+      throw BadRequest("'prompt_name' cannot be applied to pure-media input without text", "prompt_name");
+    }
+    if (wrap_bos_eos && fmt.tokenizer().eos_token_id().has_value()) {
+      ids.push_back(*fmt.tokenizer().eos_token_id());
+    }
+    if (ids.empty()) {
+      throw BadRequest(std::string(where_desc) + " tokenized to 0 tokens", "input");
+    }
+    if (static_cast<int>(ids.size()) > opts.max_model_len) {
+      throw BadRequest("input has " + std::to_string(ids.size()) + " tokens; the model context is " +
+                           std::to_string(opts.max_model_len),
+                       "input");
+    }
+    out.request.inputs.push_back(std::move(ids));
+    per_item_images.push_back(std::move(item_imgs));
+    per_item_audios.push_back(std::move(item_auds));
+  };
+
+  if (inp->is_string()) {
+    encode_text_item(inp->get_ref<const std::string&>(), "'input'");
+  } else if (inp->is_array()) {
+    if (inp->empty()) throw BadRequest("'input' array must not be empty", "input");
+    if ((*inp)[0].is_object()) {
+      // Single multimodal item expressed as an array of content-part objects.
+      encode_parts_item(*inp, "'input'");
+    } else {
+      out.request.inputs.reserve(inp->size());
+      per_item_images.reserve(inp->size());
+      per_item_audios.reserve(inp->size());
+      for (std::size_t i = 0; i < inp->size(); ++i) {
+        const Json& elem = (*inp)[i];
+        const std::string desc = "'input[" + std::to_string(i) + "]'";
+        if (elem.is_string()) {
+          encode_text_item(elem.get_ref<const std::string&>(), desc.c_str());
+        } else if (elem.is_array()) {
+          encode_parts_item(elem, desc.c_str());
+        } else {
+          throw BadRequest(desc + " must be a string or a content-parts array", "input");
+        }
+      }
+    }
+  } else {
+    throw BadRequest("'input' must be a string, an array of strings, or multimodal content parts", "input");
+  }
+  if (any_images) {
+    out.request.images = std::move(per_item_images);
+  }
+  if (any_audios) {
+    out.request.audios = std::move(per_item_audios);
+  }
+
+  if (const Json* ef = get(body, "encoding_format")) {
+    if (!ef->is_string()) throw BadRequest("'encoding_format' must be a string", "encoding_format");
+    const std::string& v = ef->get_ref<const std::string&>();
+    if (v == "float") {
+      out.encoding_format = EmbeddingEncodingFormat::Float;
+    } else if (v == "base64") {
+      out.encoding_format = EmbeddingEncodingFormat::Base64;
+    } else {
+      throw BadRequest("'encoding_format' must be 'float' or 'base64'", "encoding_format");
+    }
+  }
+
+  if (const Json* pool = get(body, "pooling")) {
+    if (!pool->is_string()) throw BadRequest("'pooling' must be a string", "pooling");
+    try {
+      out.request.pooling = model::parse_embedding_pooling(pool->get_ref<const std::string&>());
+    } catch (const std::invalid_argument& e) {
+      throw BadRequest(e.what(), "pooling");
+    }
+  }
+
+  if (const Json* norm = get(body, "normalize")) {
+    if (!norm->is_boolean()) throw BadRequest("'normalize' must be a boolean", "normalize");
+    out.request.normalize = norm->get<bool>();
+  }
+
+  if (const Json* tv = get(body, "tap_layer")) {
+    if (opts.num_tap_layers <= 0) {
+      throw BadRequest("'tap_layer' is not supported by this model backend", "tap_layer");
+    }
+    out.request.tap_layer = parse_json_int_in_range(*tv, 0, opts.num_tap_layers - 1, "tap_layer", "'tap_layer'");
+  }
+
+  if (const Json* cid = get(body, "cartridge_id")) {
+    if (!cid->is_string() || cid->get_ref<const std::string&>().empty()) {
+      throw BadRequest("'cartridge_id' must be a non-empty string", "cartridge_id");
+    }
+    out.request.cartridge_id = cid->get<std::string>();
+  }
+
+  if (const Json* csha = get(body, "cartridge_sha256")) {
+    if (!csha->is_string() || csha->get_ref<const std::string&>().empty()) {
+      throw BadRequest("'cartridge_sha256' must be a non-empty string", "cartridge_sha256");
+    }
+    out.request.cartridge_sha256 = csha->get<std::string>();
+  }
+
+  if (const Json* pk = get(body, "platos_key")) {
+    if (!pk->is_boolean()) throw BadRequest("'platos_key' must be a boolean", "platos_key");
+    out.request.use_platos_key = pk->get<bool>();
+    if (out.request.use_platos_key && !opts.has_platos_key) {
+      throw BadRequest("'platos_key' requested but server was started without --platos-key", "platos_key");
+    }
+  }
+
+  if (!out.request.use_platos_key &&
+      (out.request.cartridge_id.has_value() || out.request.cartridge_sha256.has_value())) {
+    throw BadRequest("'cartridge_id'/'cartridge_sha256' require 'platos_key': true",
+                     out.request.cartridge_sha256.has_value() ? "cartridge_sha256" : "cartridge_id");
+  }
+
+  const int active_embed_dim =
+      out.request.tap_layer.has_value()
+          ? (opts.tap_embedding_dim > 0 ? opts.tap_embedding_dim : opts.embedding_dim)
+          : opts.embedding_dim;
+
+  if (out.request.use_platos_key && opts.loaded_platos_key != nullptr) {
+    try {
+      opts.loaded_platos_key->validate_request_tap(out.request.tap_layer);
+    } catch (const std::invalid_argument& e) {
+      throw BadRequest(e.what(), "tap_layer");
+    }
+    try {
+      opts.loaded_platos_key->validate_request_identity(out.request.cartridge_id.value_or(""),
+                                                        out.request.cartridge_sha256.value_or(""));
+    } catch (const std::invalid_argument& e) {
+      const std::string_view msg(e.what());
+      const char* param = (msg.find("cartridge_id") != std::string_view::npos) ? "cartridge_id" : "cartridge_sha256";
+      throw BadRequest(e.what(), param);
+    }
+    if (active_embed_dim > 0 && opts.loaded_platos_key->in_dim() != active_embed_dim) {
+      throw BadRequest("platos_key d_in (" + std::to_string(opts.loaded_platos_key->in_dim()) +
+                           ") does not match active " +
+                           (out.request.tap_layer.has_value() ? "tap_layer" : "final") + " embedding dim (" +
+                           std::to_string(active_embed_dim) + ")",
+                       "tap_layer");
+    }
+  }
+
+  if (const Json* dv = get(body, "dimensions")) {
+    const int d = parse_json_int_in_range(*dv, 1, std::numeric_limits<int>::max(), "dimensions", "'dimensions'");
+    if (out.request.use_platos_key) {
+      throw BadRequest("'dimensions' cannot be combined with 'platos_key'", "dimensions");
+    }
+    if (!opts.matryoshka_dims.empty()) {
+      if (!out.request.tap_layer.has_value()) {
+        if (std::find(opts.matryoshka_dims.begin(), opts.matryoshka_dims.end(), d) == opts.matryoshka_dims.end()) {
+          std::string allowed;
+          for (std::size_t i = 0; i < opts.matryoshka_dims.size(); ++i) {
+            if (i) allowed += ", ";
+            allowed += std::to_string(opts.matryoshka_dims[i]);
+          }
+          throw BadRequest("'dimensions' must be one of [" + allowed + "]", "dimensions");
+        }
+      } else if (active_embed_dim > 0 && d > active_embed_dim) {
+        throw BadRequest("'dimensions' (" + std::to_string(d) + ") exceeds tap embedding dim (" +
+                             std::to_string(active_embed_dim) + ")",
+                         "dimensions");
+      }
+    } else if (active_embed_dim > 0 && d != active_embed_dim) {
+      throw BadRequest("'dimensions' truncation is not supported by this model (native dim is " +
+                           std::to_string(active_embed_dim) + ")",
+                       "dimensions");
+    }
+    out.request.dimensions = d;
+  }
+
+  return out;
+}
+
+std::string encode_embedding_base64(std::span<const float> vec) {
+  static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const std::size_t nbytes = vec.size() * sizeof(float);
+  std::vector<std::uint8_t> bytes(nbytes);
+  for (std::size_t i = 0; i < vec.size(); ++i) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &vec[i], sizeof(bits));
+    bytes[i * 4 + 0] = static_cast<std::uint8_t>(bits & 0xffu);
+    bytes[i * 4 + 1] = static_cast<std::uint8_t>((bits >> 8) & 0xffu);
+    bytes[i * 4 + 2] = static_cast<std::uint8_t>((bits >> 16) & 0xffu);
+    bytes[i * 4 + 3] = static_cast<std::uint8_t>((bits >> 24) & 0xffu);
+  }
+  std::string out;
+  out.reserve(((nbytes + 2) / 3) * 4);
+  for (std::size_t i = 0; i < nbytes; i += 3) {
+    const std::uint32_t b0 = bytes[i];
+    const std::uint32_t b1 = (i + 1 < nbytes) ? bytes[i + 1] : 0u;
+    const std::uint32_t b2 = (i + 2 < nbytes) ? bytes[i + 2] : 0u;
+    const std::uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
+    out.push_back(kAlphabet[(triple >> 18) & 0x3fu]);
+    out.push_back(kAlphabet[(triple >> 12) & 0x3fu]);
+    out.push_back(i + 1 < nbytes ? kAlphabet[(triple >> 6) & 0x3fu] : '=');
+    out.push_back(i + 2 < nbytes ? kAlphabet[triple & 0x3fu] : '=');
+  }
+  return out;
+}
+
+Json embedding_response_json(const std::string& model_id, const model::EmbeddingResult& result,
+                             EmbeddingEncodingFormat format) {
+  Json data = Json::array();
+  for (std::size_t i = 0; i < result.embeddings.size(); ++i) {
+    const auto& vec = result.embeddings[i];
+    Json emb;
+    if (format == EmbeddingEncodingFormat::Base64) {
+      emb = encode_embedding_base64(vec);
+    } else {
+      emb = Json::array();
+      for (float v : vec) emb.push_back(v);
+    }
+    data.push_back(Json{{"object", "embedding"}, {"index", static_cast<int>(i)}, {"embedding", std::move(emb)}});
+  }
+  return Json{{"object", "list"},
+              {"data", std::move(data)},
+              {"model", model_id},
+              {"usage",
+               {{"prompt_tokens", result.stats.total_prompt_tokens},
+                {"total_tokens", result.stats.total_prompt_tokens}}}};
+}
 
 }  // namespace ingine::serve
