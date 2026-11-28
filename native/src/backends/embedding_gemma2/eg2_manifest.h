@@ -96,7 +96,61 @@ Eg2ManifestSummary inspect_eg2_manifest(const std::filesystem::path& model_dir);
 // and returns FP32 host weights (used by CPU backend and sm_70 FP32 CUDA backend).
 Eg2TextWeightsF32 load_eg2_text_weights_f32(const std::filesystem::path& model_dir);
 
+struct Eg2VisionLayerWeightsF32 {
+  std::vector<float> input_layernorm;            // [VH]
+  std::vector<float> q_proj;                     // [VH, VH]
+  std::vector<float> k_proj;                     // [VH, VH]
+  std::vector<float> v_proj;                     // [VH, VH]
+  std::vector<float> o_proj;                     // [VH, VH]
+  std::vector<float> q_norm;                     // [VHD]
+  std::vector<float> k_norm;                     // [VHD]
+  std::vector<float> post_attention_layernorm;   // [VH]
+  std::vector<float> pre_feedforward_layernorm;  // [VH]
+  std::vector<float> gate_proj;                  // [VI, VH]
+  std::vector<float> up_proj;                    // [VI, VH]
+  std::vector<float> down_proj;                  // [VH, VI]
+  std::vector<float> post_feedforward_layernorm; // [VH]
+};
+
+struct Eg2VisionWeightsF32 {
+  Eg2VisionConfig config;
+  int text_hidden_size = 512;
+  std::vector<float> patch_input_proj;           // [VH, 3 * P * P]
+  std::vector<float> position_embedding_table;   // [2, pos_emb_size, VH]
+  std::vector<Eg2VisionLayerWeightsF32> layers;  // [num_vision_layers]
+  std::vector<float> embed_vision_projection;    // [text_H, VH]
+};
+
+struct Eg2VisionLayerWeightsBf16 {
+  std::vector<std::uint16_t> input_layernorm;
+  std::vector<std::uint16_t> q_proj;
+  std::vector<std::uint16_t> k_proj;
+  std::vector<std::uint16_t> v_proj;
+  std::vector<std::uint16_t> o_proj;
+  std::vector<std::uint16_t> q_norm;
+  std::vector<std::uint16_t> k_norm;
+  std::vector<std::uint16_t> post_attention_layernorm;
+  std::vector<std::uint16_t> pre_feedforward_layernorm;
+  std::vector<std::uint16_t> gate_proj;
+  std::vector<std::uint16_t> up_proj;
+  std::vector<std::uint16_t> down_proj;
+  std::vector<std::uint16_t> post_feedforward_layernorm;
+};
+
+struct Eg2VisionWeightsBf16 {
+  Eg2VisionConfig config;
+  int text_hidden_size = 512;
+  std::vector<std::uint16_t> patch_input_proj;
+  std::vector<std::uint16_t> position_embedding_table;
+  std::vector<Eg2VisionLayerWeightsBf16> layers;
+  std::vector<std::uint16_t> embed_vision_projection;
+};
+
 // Selectively reads ONLY language_model.* tensors as raw BF16 uint16_t words (used by sm_80+ CUDA).
 Eg2TextWeightsBf16 load_eg2_text_weights_bf16(const std::filesystem::path& model_dir);
+
+// Selectively reads ONLY vision_tower.* + embed_vision.* tensors (211 tensors; 319.97 MiB BF16 / 639.94 MiB FP32).
+Eg2VisionWeightsF32 load_eg2_vision_weights_f32(const std::filesystem::path& model_dir);
+Eg2VisionWeightsBf16 load_eg2_vision_weights_bf16(const std::filesystem::path& model_dir);
 
 }  // namespace ingine::backends::embedding_gemma2

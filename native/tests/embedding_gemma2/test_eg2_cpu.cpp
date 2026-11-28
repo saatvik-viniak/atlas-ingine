@@ -398,12 +398,95 @@ void test_real_checkpoint_tokenizer_manifest_http_and_oracle(const std::filesyst
   std::printf("[PASS] real checkpoint CPU FP32 oracle & live HTTP ChatServer verified\n");
 }
 
+void test_phase2_vision_preprocess_and_synthetic_scatter() {
+  // Exact Gemma4ImageProcessor aspect-ratio sizing checks
+  {
+    const auto s1 = eg2_aspect_ratio_preserving_size(96, 96, 280);
+    CHECK(s1.target_height == 768 && s1.target_width == 768 && s1.num_patches == 2304 && s1.num_soft_tokens == 256);
+    const auto s2 = eg2_aspect_ratio_preserving_size(127, 193, 280);
+    CHECK(s2.target_height == 624 && s2.target_width == 960 && s2.num_patches == 2340 && s2.num_soft_tokens == 260);
+    const auto s3 = eg2_aspect_ratio_preserving_size(127, 193, 70);
+    CHECK(s3.target_height == 288 && s3.target_width == 480 && s3.num_patches == 540 && s3.num_soft_tokens == 60);
+    const auto s4 = eg2_aspect_ratio_preserving_size(96, 96, 140);
+    CHECK(s4.target_height == 528 && s4.target_width == 528 && s4.num_soft_tokens == 121);
+    bool threw = false;
+    try {
+      (void)eg2_aspect_ratio_preserving_size(96, 96, 200);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+
+  // Bicubic antialias resize sanity on constant + linear gradient image
+  {
+    std::vector<std::uint8_t> solid(64 * 48 * 3);
+    for (std::size_t i = 0; i < 64 * 48; ++i) {
+      solid[3 * i + 0] = 20;
+      solid[3 * i + 1] = 100;
+      solid[3 * i + 2] = 220;
+    }
+    const auto resized = ingine::image::resize_bicubic_antialias(solid, 48, 64, 96, 144);
+    CHECK(resized.size() == 96u * 144u * 3u);
+    for (std::size_t i = 0; i < 96u * 144u; ++i) {
+      CHECK(resized[3 * i + 0] == 20 && resized[3 * i + 1] == 100 && resized[3 * i + 2] == 220);
+    }
+  }
+
+  // Synthetic tiny Vision + Text multimodal scatter end-to-end check
+  {
+    Eg2VisionWeightsF32 vw;
+    vw.config.hidden_size = 16;
+    vw.config.intermediate_size = 32;
+    vw.config.num_hidden_layers = 2;
+    vw.config.num_attention_heads = 2;
+    vw.config.num_key_value_heads = 2;
+    vw.config.head_dim = 8;
+    vw.config.patch_size = 2;
+    vw.config.pooling_kernel_size = 2;
+    vw.config.position_embedding_size = 64;
+    vw.config.default_output_length = 70;
+    vw.text_hidden_size = 8;
+    const int patch_in = 3 * 2 * 2;
+    vw.patch_input_proj.assign(16 * patch_in, 0.05f);
+    vw.position_embedding_table.assign(2 * 64 * 16, 0.01f);
+    vw.embed_vision_projection.assign(8 * 16, 0.04f);
+    vw.layers.resize(2);
+    for (auto& lw : vw.layers) {
+      lw.input_layernorm.assign(16, 1.0f);
+      lw.q_proj.assign(16 * 16, 0.02f);
+      lw.k_proj.assign(16 * 16, 0.02f);
+      lw.v_proj.assign(16 * 16, 0.02f);
+      lw.o_proj.assign(16 * 16, 0.02f);
+      lw.q_norm.assign(8, 1.0f);
+      lw.k_norm.assign(8, 1.0f);
+      lw.post_attention_layernorm.assign(16, 1.0f);
+      lw.pre_feedforward_layernorm.assign(16, 1.0f);
+      lw.gate_proj.assign(32 * 16, 0.02f);
+      lw.up_proj.assign(32 * 16, 0.02f);
+      lw.down_proj.assign(16 * 32, 0.02f);
+      lw.post_feedforward_layernorm.assign(16, 1.0f);
+    }
+    Eg2CpuVisionEncoder venc(std::move(vw));
+    Eg2PreprocessedImage prep;
+    prep.size = {4, 4, 2, 2, 4, 1};
+    prep.patches_f32.assign(4 * patch_in, 0.75f);
+    prep.pos_x = {0, 1, 0, 1};
+    prep.pos_y = {0, 0, 1, 1};
+    const auto soft = venc.encode_preprocessed(prep);
+    CHECK(soft.size() == 8);
+    for (float v : soft) CHECK(std::isfinite(v));
+  }
+  std::printf("[PASS] Phase 2 vision preprocessing, bicubic antialias & synthetic ViT encoder verified\n");
+}
+
 }  // namespace
 
 int main() {
   try {
     test_model_family_enum();
     test_synthetic_cpu_encoder_and_matryoshka();
+    test_phase2_vision_preprocess_and_synthetic_scatter();
     const auto eg2_dir = find_eg2_model_dir();
     if (!eg2_dir.empty()) {
       test_real_checkpoint_tokenizer_manifest_http_and_oracle(eg2_dir);

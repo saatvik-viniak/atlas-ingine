@@ -59,6 +59,25 @@ Eg2Config Eg2Config::parse(std::string_view config_json, std::string_view st_con
   cfg.vision_soft_tokens_per_image = root.value("vision_soft_tokens_per_image", cfg.vision_soft_tokens_per_image);
   cfg.has_vision_config = root.contains("vision_config") && root["vision_config"].is_object();
   cfg.has_audio_config = root.contains("audio_config") && root["audio_config"].is_object();
+  if (cfg.has_vision_config) {
+    const nlohmann::json& vc = root["vision_config"];
+    cfg.vision.hidden_size = vc.value("hidden_size", cfg.vision.hidden_size);
+    cfg.vision.intermediate_size = vc.value("intermediate_size", cfg.vision.intermediate_size);
+    cfg.vision.num_hidden_layers = vc.value("num_hidden_layers", cfg.vision.num_hidden_layers);
+    cfg.vision.num_attention_heads = vc.value("num_attention_heads", cfg.vision.num_attention_heads);
+    cfg.vision.num_key_value_heads = vc.value("num_key_value_heads", cfg.vision.num_key_value_heads);
+    cfg.vision.head_dim = vc.value("head_dim", cfg.vision.head_dim);
+    cfg.vision.patch_size = vc.value("patch_size", cfg.vision.patch_size);
+    cfg.vision.pooling_kernel_size = vc.value("pooling_kernel_size", cfg.vision.pooling_kernel_size);
+    cfg.vision.position_embedding_size = vc.value("position_embedding_size", cfg.vision.position_embedding_size);
+    cfg.vision.default_output_length = vc.value("default_output_length", cfg.vision_soft_tokens_per_image);
+    cfg.vision.rms_norm_eps = vc.value("rms_norm_eps", cfg.vision.rms_norm_eps);
+    cfg.vision.standardize = vc.value("standardize", cfg.vision.standardize);
+    cfg.vision.use_clipped_linears = vc.value("use_clipped_linears", cfg.vision.use_clipped_linears);
+    if (auto rp = vc.find("rope_parameters"); rp != vc.end() && rp->is_object()) {
+      cfg.vision.rope_theta = rp->value("rope_theta", cfg.vision.rope_theta);
+    }
+  }
 
   const nlohmann::json& tc = root.contains("text_config") && root["text_config"].is_object() ? root["text_config"] : root;
   cfg.vocab_size = tc.value("vocab_size", cfg.vocab_size);

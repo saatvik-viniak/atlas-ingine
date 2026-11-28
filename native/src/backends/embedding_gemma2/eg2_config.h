@@ -24,6 +24,24 @@ struct LayerSpec {
   double rope_theta = 10000.0;
 };
 
+struct Eg2VisionConfig {
+  int hidden_size = 768;
+  int intermediate_size = 3072;
+  int num_hidden_layers = 16;
+  int num_attention_heads = 12;
+  int num_key_value_heads = 12;
+  int head_dim = 64;
+  int patch_size = 16;
+  int pooling_kernel_size = 3;
+  int position_embedding_size = 10240;
+  int default_output_length = 280;
+  int video_max_soft_tokens = 140;
+  float rms_norm_eps = 1e-6f;
+  double rope_theta = 100.0;
+  bool standardize = false;
+  bool use_clipped_linears = false;
+};
+
 struct Eg2Config {
   std::string model_type = "embedding_gemma2";
   std::vector<std::string> architectures;
@@ -65,6 +83,7 @@ struct Eg2Config {
   bool has_vision_config = false;
   bool has_audio_config = false;
   int vision_soft_tokens_per_image = 280;
+  Eg2VisionConfig vision;
 
   // Named task prefixes from config_sentence_transformers.json (optional)
   std::map<std::string, std::string> prompts;

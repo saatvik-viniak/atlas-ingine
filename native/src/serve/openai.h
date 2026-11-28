@@ -93,6 +93,11 @@ struct EmbeddingParseOptions {
   int num_tap_layers = 0;
   bool has_platos_key = false;
   const PlatosKey* loaded_platos_key = nullptr;
+  bool supports_images = false;
+  bool supports_audio = false;
+  int vision_soft_tokens_per_image = 280;
+  int video_soft_tokens_per_frame = 140;
+  image::Limits image_limits;
   std::vector<int> matryoshka_dims;
   std::map<std::string, std::string> prompt_prefixes;
 };

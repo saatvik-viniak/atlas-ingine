@@ -310,8 +310,19 @@ inline EmbeddingPooling parse_embedding_pooling(std::string_view s) {
                               "' (expected 'mean', 'last_token', or 'cls')");
 }
 
+struct EmbeddingImage {
+  int width = 0;
+  int height = 0;
+  std::vector<std::uint8_t> rgb;  // [height, width, 3] raw RGB bytes
+  int max_soft_tokens = 280;      // {70, 140, 280, 560, 1120}; default 280 images, 140 video frames
+  bool is_video_frame = false;    // true -> expands <|video|>, false -> <|image|>
+};
+
 struct EmbeddingRequest {
   std::vector<std::vector<std::int32_t>> inputs;  // non-empty batch of non-empty token-id sequences
+  // Optional per-item multimodal images / video frames (empty for text-only requests; when non-empty,
+  // images.size() == inputs.size() and total soft tokens per item equals <|image|>/<|video|> placeholders).
+  std::vector<std::vector<EmbeddingImage>> images;
   EmbeddingPooling pooling = EmbeddingPooling::Mean;
   bool normalize = true;
   // Optional early-exit layer/visit index (0-based). std::nullopt = full forward pass + final norm.

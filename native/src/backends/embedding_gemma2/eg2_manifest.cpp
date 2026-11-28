@@ -226,4 +226,110 @@ Eg2TextWeightsBf16 load_eg2_text_weights_bf16(const std::filesystem::path& model
   return w;
 }
 
+namespace {
+
+void validate_vision_tensors(const SafetensorsModel& model, const Eg2Config& cfg) {
+  if (!cfg.has_vision_config) {
+    throw std::invalid_argument("EmbeddingGemma2: model config has no vision_config");
+  }
+  const Eg2VisionConfig& vc = cfg.vision;
+  if (vc.use_clipped_linears || vc.standardize) {
+    throw std::invalid_argument("EmbeddingGemma2: clipped vision linears / standardize are not supported");
+  }
+  const std::int64_t VH = vc.hidden_size;
+  const std::int64_t VI = vc.intermediate_size;
+  const std::int64_t VHD = vc.head_dim;
+  const std::int64_t VQ = static_cast<std::int64_t>(vc.num_attention_heads) * VHD;
+  const std::int64_t VKV = static_cast<std::int64_t>(vc.num_key_value_heads) * VHD;
+  const std::int64_t patch_in = 3 * static_cast<std::int64_t>(vc.patch_size) * vc.patch_size;
+
+  require_tensor_shape_and_dtype(model, "vision_tower.patch_embedder.input_proj.weight", {VH, patch_in});
+  require_tensor_shape_and_dtype(model, "vision_tower.patch_embedder.position_embedding_table",
+                                 {2, vc.position_embedding_size, VH});
+  require_tensor_shape_and_dtype(model, "embed_vision.embedding_projection.weight", {cfg.hidden_size, VH});
+
+  for (int i = 0; i < vc.num_hidden_layers; ++i) {
+    const std::string p = "vision_tower.encoder.layers." + std::to_string(i) + ".";
+    require_tensor_shape_and_dtype(model, p + "input_layernorm.weight", {VH});
+    require_tensor_shape_and_dtype(model, p + "self_attn.q_proj.linear.weight", {VQ, VH});
+    require_tensor_shape_and_dtype(model, p + "self_attn.k_proj.linear.weight", {VKV, VH});
+    require_tensor_shape_and_dtype(model, p + "self_attn.v_proj.linear.weight", {VKV, VH});
+    require_tensor_shape_and_dtype(model, p + "self_attn.o_proj.linear.weight", {VH, VQ});
+    require_tensor_shape_and_dtype(model, p + "self_attn.q_norm.weight", {VHD});
+    require_tensor_shape_and_dtype(model, p + "self_attn.k_norm.weight", {VHD});
+    require_tensor_shape_and_dtype(model, p + "post_attention_layernorm.weight", {VH});
+    require_tensor_shape_and_dtype(model, p + "pre_feedforward_layernorm.weight", {VH});
+    require_tensor_shape_and_dtype(model, p + "mlp.gate_proj.linear.weight", {VI, VH});
+    require_tensor_shape_and_dtype(model, p + "mlp.up_proj.linear.weight", {VI, VH});
+    require_tensor_shape_and_dtype(model, p + "mlp.down_proj.linear.weight", {VH, VI});
+    require_tensor_shape_and_dtype(model, p + "post_feedforward_layernorm.weight", {VH});
+  }
+}
+
+}  // namespace
+
+Eg2VisionWeightsF32 load_eg2_vision_weights_f32(const std::filesystem::path& model_dir) {
+  const Eg2Config cfg = Eg2Config::load(model_dir);
+  SafetensorsModel model(model_dir, SafetensorsOpenMode::SafetensorsOnly);
+  validate_vision_tensors(model, cfg);
+
+  Eg2VisionWeightsF32 w;
+  w.config = cfg.vision;
+  w.text_hidden_size = cfg.hidden_size;
+  w.patch_input_proj = read_tensor_f32(model, "vision_tower.patch_embedder.input_proj.weight");
+  w.position_embedding_table = read_tensor_f32(model, "vision_tower.patch_embedder.position_embedding_table");
+  w.embed_vision_projection = read_tensor_f32(model, "embed_vision.embedding_projection.weight");
+  w.layers.resize(static_cast<std::size_t>(cfg.vision.num_hidden_layers));
+  for (int i = 0; i < cfg.vision.num_hidden_layers; ++i) {
+    const std::string p = "vision_tower.encoder.layers." + std::to_string(i) + ".";
+    auto& lw = w.layers[static_cast<std::size_t>(i)];
+    lw.input_layernorm = read_tensor_f32(model, p + "input_layernorm.weight");
+    lw.q_proj = read_tensor_f32(model, p + "self_attn.q_proj.linear.weight");
+    lw.k_proj = read_tensor_f32(model, p + "self_attn.k_proj.linear.weight");
+    lw.v_proj = read_tensor_f32(model, p + "self_attn.v_proj.linear.weight");
+    lw.o_proj = read_tensor_f32(model, p + "self_attn.o_proj.linear.weight");
+    lw.q_norm = read_tensor_f32(model, p + "self_attn.q_norm.weight");
+    lw.k_norm = read_tensor_f32(model, p + "self_attn.k_norm.weight");
+    lw.post_attention_layernorm = read_tensor_f32(model, p + "post_attention_layernorm.weight");
+    lw.pre_feedforward_layernorm = read_tensor_f32(model, p + "pre_feedforward_layernorm.weight");
+    lw.gate_proj = read_tensor_f32(model, p + "mlp.gate_proj.linear.weight");
+    lw.up_proj = read_tensor_f32(model, p + "mlp.up_proj.linear.weight");
+    lw.down_proj = read_tensor_f32(model, p + "mlp.down_proj.linear.weight");
+    lw.post_feedforward_layernorm = read_tensor_f32(model, p + "post_feedforward_layernorm.weight");
+  }
+  return w;
+}
+
+Eg2VisionWeightsBf16 load_eg2_vision_weights_bf16(const std::filesystem::path& model_dir) {
+  const Eg2Config cfg = Eg2Config::load(model_dir);
+  SafetensorsModel model(model_dir, SafetensorsOpenMode::SafetensorsOnly);
+  validate_vision_tensors(model, cfg);
+
+  Eg2VisionWeightsBf16 w;
+  w.config = cfg.vision;
+  w.text_hidden_size = cfg.hidden_size;
+  w.patch_input_proj = read_tensor_bf16(model, "vision_tower.patch_embedder.input_proj.weight");
+  w.position_embedding_table = read_tensor_bf16(model, "vision_tower.patch_embedder.position_embedding_table");
+  w.embed_vision_projection = read_tensor_bf16(model, "embed_vision.embedding_projection.weight");
+  w.layers.resize(static_cast<std::size_t>(cfg.vision.num_hidden_layers));
+  for (int i = 0; i < cfg.vision.num_hidden_layers; ++i) {
+    const std::string p = "vision_tower.encoder.layers." + std::to_string(i) + ".";
+    auto& lw = w.layers[static_cast<std::size_t>(i)];
+    lw.input_layernorm = read_tensor_bf16(model, p + "input_layernorm.weight");
+    lw.q_proj = read_tensor_bf16(model, p + "self_attn.q_proj.linear.weight");
+    lw.k_proj = read_tensor_bf16(model, p + "self_attn.k_proj.linear.weight");
+    lw.v_proj = read_tensor_bf16(model, p + "self_attn.v_proj.linear.weight");
+    lw.o_proj = read_tensor_bf16(model, p + "self_attn.o_proj.linear.weight");
+    lw.q_norm = read_tensor_bf16(model, p + "self_attn.q_norm.weight");
+    lw.k_norm = read_tensor_bf16(model, p + "self_attn.k_norm.weight");
+    lw.post_attention_layernorm = read_tensor_bf16(model, p + "post_attention_layernorm.weight");
+    lw.pre_feedforward_layernorm = read_tensor_bf16(model, p + "pre_feedforward_layernorm.weight");
+    lw.gate_proj = read_tensor_bf16(model, p + "mlp.gate_proj.linear.weight");
+    lw.up_proj = read_tensor_bf16(model, p + "mlp.up_proj.linear.weight");
+    lw.down_proj = read_tensor_bf16(model, p + "mlp.down_proj.linear.weight");
+    lw.post_feedforward_layernorm = read_tensor_bf16(model, p + "post_feedforward_layernorm.weight");
+  }
+  return w;
+}
+
 }  // namespace ingine::backends::embedding_gemma2

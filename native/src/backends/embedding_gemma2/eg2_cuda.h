@@ -30,7 +30,7 @@ class Eg2CudaBackend final : public ingine::model::ModelBackend {
   ingine::model::GenerateStats generate(std::span<const std::int32_t>, int, const ingine::model::Sampling&,
                                         std::span<const std::int32_t>,
                                         const std::function<bool(std::span<const std::int32_t>)>&) override;
-  bool supports_images() const override { return false; }
+  bool supports_images() const override { return has_vision_; }
   bool supports_audio() const override { return false; }
   bool is_encoder_only() const override { return true; }
   bool supports_logit_masker() const override { return false; }
@@ -70,6 +70,7 @@ class Eg2CudaBackend final : public ingine::model::ModelBackend {
   std::string model_id_ = "embeddinggemma-2";
   int max_ctx_ = 8192;
   bool use_bf16_ = false;
+  bool has_vision_ = false;
   ingine::model::BackendCapabilities caps_;
   ingine::model::WorkerProfile profile_;
   ingine::model::BackendStateIdentity identity_;

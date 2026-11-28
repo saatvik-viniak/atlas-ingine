@@ -1,12 +1,14 @@
 add_library(ingine_eg2_cpu STATIC
   eg2_config.cpp
   eg2_manifest.cpp
+  eg2_vision.cpp
   eg2_cpu.cpp
 )
 
 target_link_libraries(ingine_eg2_cpu PUBLIC
   ingine_core
   ingine_engine
+  ingine_image
   ingine_text
   nlohmann_json::nlohmann_json
 )

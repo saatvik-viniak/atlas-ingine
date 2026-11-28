@@ -360,6 +360,10 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
                 {"embed_running", st.embed_running},
                 {"max_batch", st.max_batch},
                 {"max_queue", st.max_queue}};
+    Json modalities = Json::array({"text"});
+    if (image_options_.enabled) modalities.push_back("image");
+    if (supports_audio_) modalities.push_back("audio");
+    health["input_modalities"] = std::move(modalities);
     if (is_encoder_only_) health["encoder_only"] = true;
     if (!matryoshka_dims_.empty()) health["matryoshka_dims"] = matryoshka_dims_;
     if (!platos_key_tap_spec_.empty()) health["platos_key_tap_spec"] = platos_key_tap_spec_;
@@ -429,6 +433,9 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
       popts.num_tap_layers = num_tap_layers_;
       popts.has_platos_key = has_platos_key_;
       popts.loaded_platos_key = platos_key_.get();
+      popts.supports_images = image_options_.enabled;
+      popts.supports_audio = supports_audio_;
+      popts.image_limits = image_options_.limits;
       popts.matryoshka_dims = matryoshka_dims_;
       popts.prompt_prefixes = embedding_prompt_prefixes_;
       emb_req = parse_embedding_request(body, fmt_, popts);
