@@ -46,6 +46,7 @@ inline constexpr std::string_view EFFORT_LEVELS[] = {"none", "minimal", "low", "
 enum class ChatFormatKind : std::uint8_t {
   Inkling2 = 0,
   Qwen3_5 = 1,
+  EmbeddingGemma2 = 2,
 };
 
 // Invalid chat request (HTTP 400); `param` names the offending request field. what() is the Python message.

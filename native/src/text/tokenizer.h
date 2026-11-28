@@ -70,6 +70,8 @@ class Tokenizer {
   // otherwise the whole text is ordinary (encode_special_tokens=True). Throws std::invalid_argument on
   // invalid UTF-8.
   std::vector<int32_t> encode(std::string_view text, bool special) const;
+  // encode(text, special) wrapped with post_processor TemplateProcessing (<bos> ... <eos>) when present.
+  std::vector<int32_t> encode_with_post_processor(std::string_view text, bool special) const;
   // encode(text, true) appended to ids; with boundaries, records every added token's TokenBoundary (byte
   // offsets shifted by byte_base, token counts absolute in ids).
   void encode_special(std::string_view text, std::vector<int32_t>& ids, std::vector<TokenBoundary>* boundaries,
@@ -93,20 +95,27 @@ class Tokenizer {
   // Number of ids (vocabulary + added tokens), i.e. one past the largest id.
   std::size_t vocab_size() const noexcept { return token_bytes_.size(); }
 
-  enum class NormalizerKind : std::uint8_t { None = 0, Nfc = 1 };
-  enum class SplitMode : std::uint8_t { O200k = 0, Qwen2 = 1, ChatGlm4 = 2 };
+  enum class NormalizerKind : std::uint8_t { None = 0, Nfc = 1, ReplaceSpaceToMetaspace = 2 };
+  enum class SplitMode : std::uint8_t { O200k = 0, Qwen2 = 1, ChatGlm4 = 2, GemmaBpe = 3 };
 
   NormalizerKind normalizer_kind() const noexcept { return normalizer_; }
   SplitMode split_mode() const noexcept { return split_mode_; }
+  bool byte_fallback() const noexcept { return byte_fallback_; }
+  std::optional<int32_t> bos_token_id() const noexcept { return bos_token_id_; }
+  std::optional<int32_t> eos_token_id() const noexcept { return eos_token_id_; }
 
  private:
   Tokenizer() = default;
   void encode_ordinary(std::string_view text, std::vector<int32_t>& ids) const;
   void encode_piece(std::string_view piece, std::vector<int32_t>& ids) const;
+  void encode_piece_gemma(std::string_view text, std::vector<int32_t>& ids) const;
 
   NormalizerKind normalizer_ = NormalizerKind::None;
   SplitMode split_mode_ = SplitMode::O200k;
   bool ignore_merges_ = true;
+  bool byte_fallback_ = false;
+  std::optional<int32_t> bos_token_id_;
+  std::optional<int32_t> eos_token_id_;
   std::vector<std::string> token_bytes_;  // raw bytes per id (added tokens: their content)
   std::vector<bool> special_;
   std::vector<bool> added_;

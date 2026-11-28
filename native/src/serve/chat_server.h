@@ -83,9 +83,13 @@ class ChatServer {
   const int loop_passes_;
   const model::LoopCdMode loopcd_mode_;
   const bool supports_logit_masker_;
+  const bool supports_audio_;
+  const bool is_encoder_only_;
   const bool supports_embeddings_;
   const int embedding_dim_;
   const int num_tap_layers_;
+  const std::vector<int> matryoshka_dims_;
+  const std::map<std::string, std::string> embedding_prompt_prefixes_;
   const bool has_platos_key_;
   const int platos_key_out_dim_;
   const std::string platos_key_tap_spec_;

@@ -45,23 +45,120 @@ bool has_type(const Json& v, const char* name) {
   return v.is_object() && v.contains("type") && v["type"] == name;
 }
 
+constexpr std::string_view kMetaspace = "\xE2\x96\x81";  // U+2581 LOWER ONE EIGHTH BLOCK
+
 struct PipelineSpec {
   Tokenizer::NormalizerKind normalizer = Tokenizer::NormalizerKind::None;
   Tokenizer::SplitMode split = Tokenizer::SplitMode::O200k;
   bool ignore_merges = true;
+  bool byte_fallback = false;
+  std::optional<std::int32_t> bos_token_id;
+  std::optional<std::int32_t> eos_token_id;
 };
+
+std::optional<int> parse_gemma_byte_token(std::string_view symbol) noexcept {
+  if (symbol.size() != 6 || symbol[0] != '<' || symbol[1] != '0' || symbol[2] != 'x' || symbol[5] != '>') {
+    return std::nullopt;
+  }
+  auto hex = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+  };
+  const int hi = hex(symbol[3]);
+  const int lo = hex(symbol[4]);
+  if (hi < 0 || lo < 0) return std::nullopt;
+  return (hi << 4) | lo;
+}
+
+std::string replace_all_str(std::string_view src, std::string_view from, std::string_view to) {
+  std::string out;
+  out.reserve(src.size());
+  std::size_t pos = 0;
+  while (pos < src.size()) {
+    const std::size_t hit = src.find(from, pos);
+    if (hit == std::string_view::npos) {
+      out.append(src.substr(pos));
+      break;
+    }
+    out.append(src.substr(pos, hit - pos));
+    out.append(to);
+    pos = hit + from.size();
+  }
+  return out;
+}
 
 // The pipelines this tokenizer implements; anything else is rejected rather than silently mis-tokenised.
 PipelineSpec validate_pipeline(const Json& root, const Json& model) {
   PipelineSpec spec;
-  if (!root.contains("normalizer") || root["normalizer"].is_null()) {
+  const Json& norm = root.contains("normalizer") ? root["normalizer"] : Json(nullptr);
+  if (norm.is_null()) {
     spec.normalizer = Tokenizer::NormalizerKind::None;
-  } else if (has_type(root["normalizer"], "NFC")) {
+  } else if (has_type(norm, "NFC")) {
     spec.normalizer = Tokenizer::NormalizerKind::Nfc;
+  } else if (has_type(norm, "Replace") && norm.contains("pattern") && norm["pattern"].is_object() &&
+             norm["pattern"].value("String", std::string{}) == " " &&
+             norm.value("content", std::string{}) == kMetaspace) {
+    spec.normalizer = Tokenizer::NormalizerKind::ReplaceSpaceToMetaspace;
   } else {
     require(false, "normalizer");
   }
+
   const Json& pre = root.at("pre_tokenizer");
+  if (spec.normalizer == Tokenizer::NormalizerKind::ReplaceSpaceToMetaspace) {
+    // Gemma-4 / EmbeddingGemma-2 SentencePiece-BPE pipeline:
+    // Replace(" " -> "▁") -> Split(" ", MergedWithPrevious) -> BPE(byte_fallback=true) ->
+    // Sequence([Replace("▁" -> " "), ByteFallback, Fuse]).
+    require(has_type(pre, "Split") && pre.contains("pattern") && pre["pattern"].is_object() &&
+                pre["pattern"].value("String", std::string{}) == " " &&
+                pre.value("behavior", std::string{}) == "MergedWithPrevious" &&
+                pre.value("invert", Json(false)) == false,
+            "pre_tokenizer.GemmaSplit");
+    const Json& dec = root.at("decoder");
+    require(has_type(dec, "Sequence") && dec.contains("decoders") && dec["decoders"].is_array() &&
+                dec["decoders"].size() == 3,
+            "decoder.GemmaSequence");
+    const Json& d0 = dec["decoders"][0];
+    require(has_type(d0, "Replace") && d0.contains("pattern") && d0["pattern"].is_object() &&
+                d0["pattern"].value("String", std::string{}) == kMetaspace &&
+                d0.value("content", std::string{}) == " ",
+            "decoder.Replace");
+    require(has_type(dec["decoders"][1], "ByteFallback"), "decoder.ByteFallback");
+    require(has_type(dec["decoders"][2], "Fuse"), "decoder.Fuse");
+    require(has_type(model, "BPE"), "model.type");
+    require(model.value("byte_fallback", Json(false)) == true, "model.byte_fallback");
+    spec.split = Tokenizer::SplitMode::GemmaBpe;
+    spec.byte_fallback = true;
+    spec.ignore_merges = model.value("ignore_merges", Json(false)) == true;
+    require(!model.contains("dropout") || model["dropout"].is_null(), "model.dropout");
+    for (const char* field : {"continuing_subword_prefix", "end_of_word_suffix"}) {
+      require(!model.contains(field) || model[field].is_null() || model[field] == "", field);
+    }
+    if (root.contains("post_processor") && has_type(root["post_processor"], "TemplateProcessing")) {
+      const Json& pp = root["post_processor"];
+      if (pp.contains("single") && pp["single"].is_array() && pp["single"].size() == 3 &&
+          pp.contains("special_tokens") && pp["special_tokens"].is_object()) {
+        const Json& s0 = pp["single"][0];
+        const Json& s1 = pp["single"][1];
+        const Json& s2 = pp["single"][2];
+        if (s0.contains("SpecialToken") && s1.contains("Sequence") && s2.contains("SpecialToken")) {
+          const std::string bos_key = s0["SpecialToken"].value("id", std::string{});
+          const std::string eos_key = s2["SpecialToken"].value("id", std::string{});
+          const Json& st = pp["special_tokens"];
+          if (st.contains(bos_key) && st[bos_key].contains("ids") && st[bos_key]["ids"].is_array() &&
+              !st[bos_key]["ids"].empty()) {
+            spec.bos_token_id = st[bos_key]["ids"][0].get<std::int32_t>();
+          }
+          if (st.contains(eos_key) && st[eos_key].contains("ids") && st[eos_key]["ids"].is_array() &&
+              !st[eos_key]["ids"].empty()) {
+            spec.eos_token_id = st[eos_key]["ids"][0].get<std::int32_t>();
+          }
+        }
+      }
+    }
+    return spec;
+  }
+
   require(has_type(pre, "Sequence") && pre.contains("pretokenizers") && pre["pretokenizers"].is_array() &&
               pre["pretokenizers"].size() == 2,
           "pre_tokenizer");
@@ -337,8 +434,12 @@ Tokenizer Tokenizer::from_json(std::string_view tokenizer_json) {
   tok.normalizer_ = spec.normalizer;
   tok.split_mode_ = spec.split;
   tok.ignore_merges_ = spec.ignore_merges;
+  tok.byte_fallback_ = spec.byte_fallback;
+  tok.bos_token_id_ = spec.bos_token_id;
+  tok.eos_token_id_ = spec.eos_token_id;
+  const bool is_gemma_bpe = (spec.split == Tokenizer::SplitMode::GemmaBpe);
   const Json& vocab = model.at("vocab");
-  std::unordered_map<std::string, std::int32_t> by_symbol;  // byte-level token string -> id (load only)
+  std::unordered_map<std::string, std::int32_t> by_symbol;  // raw token symbol string -> id (load only)
   by_symbol.reserve(vocab.size());
   std::int32_t max_id = -1;
   for (const auto& item : vocab.items()) {
@@ -352,14 +453,26 @@ Tokenizer Tokenizer::from_json(std::string_view tokenizer_json) {
   tok.token_bytes_.assign(size, {});
   tok.special_.assign(size, false);
   tok.added_.assign(size, false);
+  tok.byte_ids_.fill(-1);
   std::vector<bool> present(size, false);
   tok.vocab_by_bytes_.reserve(by_symbol.size());
   for (const auto& [symbol, id] : by_symbol) {
     if (present[static_cast<std::size_t>(id)]) throw std::invalid_argument("tokenizer.json: duplicate vocabulary id");
     present[static_cast<std::size_t>(id)] = true;
-    std::string bytes = byte_level_to_bytes(symbol, byte_decoder);
-    tok.vocab_by_bytes_.emplace(bytes, id);
-    tok.token_bytes_[static_cast<std::size_t>(id)] = std::move(bytes);
+    if (is_gemma_bpe) {
+      // Normalized UTF-8 symbol -> id (used for single-codepoint BPE init).
+      tok.vocab_by_bytes_.emplace(symbol, id);
+      if (const auto byte_val = parse_gemma_byte_token(symbol)) {
+        tok.byte_ids_[static_cast<std::size_t>(*byte_val)] = id;
+        tok.token_bytes_[static_cast<std::size_t>(id)] = std::string(1, static_cast<char>(*byte_val));
+      } else {
+        tok.token_bytes_[static_cast<std::size_t>(id)] = replace_all_str(symbol, kMetaspace, " ");
+      }
+    } else {
+      std::string bytes = byte_level_to_bytes(symbol, byte_decoder);
+      tok.vocab_by_bytes_.emplace(bytes, id);
+      tok.token_bytes_[static_cast<std::size_t>(id)] = std::move(bytes);
+    }
   }
 
   for (const Json& a : root.at("added_tokens")) {
@@ -372,7 +485,15 @@ Tokenizer Tokenizer::from_json(std::string_view tokenizer_json) {
       throw std::invalid_argument("tokenizer.json: unsupported added token " + t.content);
     }
     const auto index = static_cast<std::size_t>(t.id);
-    if (present[index]) throw std::invalid_argument("tokenizer.json: added token overlaps the vocabulary");
+    if (present[index]) {
+      if (!is_gemma_bpe) {
+        throw std::invalid_argument("tokenizer.json: added token overlaps the vocabulary");
+      }
+      const auto vit = by_symbol.find(t.content);
+      if (vit == by_symbol.end() || vit->second != t.id) {
+        throw std::invalid_argument("tokenizer.json: added token id conflicts with vocabulary entry " + t.content);
+      }
+    }
     present[index] = true;
     tok.token_bytes_[index] = t.content;
     tok.special_[index] = t.special;
@@ -413,10 +534,18 @@ Tokenizer Tokenizer::from_json(std::string_view tokenizer_json) {
       throw std::invalid_argument("tokenizer.json: duplicate merge");
     }
   }
-  for (int b = 0; b < 256; ++b) {
-    const auto it = by_symbol.find(uni::codepoint_to_utf8(b2c[static_cast<std::size_t>(b)]));
-    if (it == by_symbol.end()) throw std::invalid_argument("tokenizer.json: byte token missing");
-    tok.byte_ids_[static_cast<std::size_t>(b)] = it->second;
+  if (is_gemma_bpe) {
+    for (int b = 0; b < 256; ++b) {
+      if (tok.byte_ids_[static_cast<std::size_t>(b)] < 0) {
+        throw std::invalid_argument("tokenizer.json: Gemma byte_fallback token missing");
+      }
+    }
+  } else {
+    for (int b = 0; b < 256; ++b) {
+      const auto it = by_symbol.find(uni::codepoint_to_utf8(b2c[static_cast<std::size_t>(b)]));
+      if (it == by_symbol.end()) throw std::invalid_argument("tokenizer.json: byte token missing");
+      tok.byte_ids_[static_cast<std::size_t>(b)] = it->second;
+    }
   }
   return tok;
 }
@@ -470,8 +599,72 @@ void Tokenizer::encode_piece(std::string_view piece, std::vector<int32_t>& ids) 
   }
 }
 
+void Tokenizer::encode_piece_gemma(std::string_view text, std::vector<int32_t>& ids) const {
+  if (text.empty()) return;
+  // Validate UTF-8 on the input before space->metaspace replacement.
+  (void)uni::utf8_codepoints(text, "Tokenizer::encode input");
+  const std::string normalized = replace_all_str(text, " ", kMetaspace);
+  const auto spans = uni::utf8_codepoints(normalized, "Tokenizer::encode gemma");
+  std::vector<BpeNode> nodes;
+  nodes.reserve(spans.size());
+  for (std::size_t i = 0; i < spans.size(); ++i) {
+    const std::size_t b = spans[i].offset;
+    const std::size_t e = (i + 1 < spans.size()) ? spans[i + 1].offset : normalized.size();
+    const std::string cp(normalized.data() + b, e - b);
+    if (const auto it = vocab_by_bytes_.find(cp); it != vocab_by_bytes_.end()) {
+      nodes.push_back(BpeNode{.symbol = it->second});
+    } else {
+      for (char ch : cp) {
+        nodes.push_back(BpeNode{.symbol = byte_ids_[static_cast<unsigned char>(ch)]});
+      }
+    }
+  }
+  if (nodes.empty()) return;
+  for (std::size_t i = 0; i < nodes.size(); ++i) {
+    nodes[i].previous = static_cast<std::int32_t>(i) - 1;
+    nodes[i].next = (i + 1 == nodes.size()) ? -1 : static_cast<std::int32_t>(i + 1);
+  }
+  std::priority_queue<BpeCandidate, std::vector<BpeCandidate>, LaterBpeCandidate> queue;
+  const auto push_candidate = [&](std::int32_t left) {
+    if (left < 0 || !nodes[static_cast<std::size_t>(left)].live) return;
+    const std::int32_t right = nodes[static_cast<std::size_t>(left)].next;
+    if (right < 0) return;
+    const auto* rule = merges_.find(
+        pair_key(nodes[static_cast<std::size_t>(left)].symbol, nodes[static_cast<std::size_t>(right)].symbol));
+    if (rule == nullptr) return;
+    queue.push(BpeCandidate{rule->rank, left, right, rule->result, nodes[static_cast<std::size_t>(left)].generation,
+                            nodes[static_cast<std::size_t>(right)].generation});
+  };
+  for (std::size_t i = 0; i + 1 < nodes.size(); ++i) push_candidate(static_cast<std::int32_t>(i));
+  while (!queue.empty()) {
+    const BpeCandidate c = queue.top();
+    queue.pop();
+    BpeNode& left = nodes[static_cast<std::size_t>(c.left)];
+    BpeNode& right = nodes[static_cast<std::size_t>(c.right)];
+    if (!left.live || !right.live || left.next != c.right || left.generation != c.left_generation ||
+        right.generation != c.right_generation) {
+      continue;
+    }
+    left.symbol = c.result;
+    ++left.generation;
+    left.next = right.next;
+    right.live = false;
+    ++right.generation;
+    if (left.next >= 0) nodes[static_cast<std::size_t>(left.next)].previous = c.left;
+    push_candidate(left.previous);
+    push_candidate(c.left);
+  }
+  for (std::int32_t n = 0; n >= 0; n = nodes[static_cast<std::size_t>(n)].next) {
+    ids.push_back(nodes[static_cast<std::size_t>(n)].symbol);
+  }
+}
+
 void Tokenizer::encode_ordinary(std::string_view text, std::vector<int32_t>& ids) const {
   if (text.empty()) return;
+  if (split_mode_ == SplitMode::GemmaBpe) {
+    encode_piece_gemma(text, ids);
+    return;
+  }
   std::unique_ptr<utf8proc_uint8_t, decltype(&std::free)> nfc_buf(nullptr, &std::free);
   auto spans = uni::utf8_codepoints(text, "Tokenizer::encode input");
   if (normalizer_ == NormalizerKind::Nfc) {
@@ -516,6 +709,19 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, bool special) cons
     return ids;
   }
   encode_special(text, ids, nullptr, 0);
+  return ids;
+}
+
+std::vector<int32_t> Tokenizer::encode_with_post_processor(std::string_view text, bool special) const {
+  std::vector<int32_t> ids;
+  ids.reserve(text.size() / 3 + 3);
+  if (bos_token_id_.has_value()) ids.push_back(*bos_token_id_);
+  if (!special) {
+    encode_ordinary(text, ids);
+  } else {
+    encode_special(text, ids, nullptr, 0);
+  }
+  if (eos_token_id_.has_value()) ids.push_back(*eos_token_id_);
   return ids;
 }
 

@@ -50,6 +50,8 @@ class FakeGenerator final : public model::Generator {
     bool normalize = true;
     std::optional<int> tap_layer;
     bool use_platos_key = false;
+    std::optional<int> dimensions;
+    std::optional<std::string> prompt_name;
     int kv_slots_allocated = 0;
     bool lm_head_skipped = true;
   };
@@ -81,6 +83,8 @@ class FakeGenerator final : public model::Generator {
                                 const model::PrefillCallback& on_prefill) override;
   model::GenerateStats warm_start(const model::Prompt& prompt, const model::Sampling& sampling) override;
   bool supports_images() const override { return supports_images_; }
+  bool supports_audio() const override { return supports_audio_; }
+  bool is_encoder_only() const override { return is_encoder_only_; }
   bool supports_logit_masker() const override { return supports_logit_masker_; }
   std::string model_family() const override { return model_family_; }
   model::KvCacheMode kv_cache_mode() const override { return kv_cache_mode_; }
@@ -92,10 +96,14 @@ class FakeGenerator final : public model::Generator {
   void set_model_family(std::string family) { model_family_ = std::move(family); }
   void set_supports_logit_masker(bool enabled) { supports_logit_masker_ = enabled; }
   void set_supports_images(bool enabled) { supports_images_ = enabled; }
+  void set_supports_audio(bool enabled) { supports_audio_ = enabled; }
+  void set_is_encoder_only(bool enabled) { is_encoder_only_ = enabled; }
 
   bool supports_embeddings() const override { return supports_embeddings_; }
   int embedding_dim() const override { return embedding_dim_; }
   int num_tap_layers() const override { return num_tap_layers_; }
+  std::vector<int> matryoshka_dims() const override { return matryoshka_dims_; }
+  std::map<std::string, std::string> embedding_prompt_prefixes() const override { return embedding_prompt_prefixes_; }
   bool has_platos_key() const override { return platos_key_ != nullptr; }
   int platos_key_out_dim() const override { return platos_key_ ? platos_key_->out_dim() : 0; }
   std::string platos_key_tap_spec() const override { return platos_key_ ? platos_key_->metadata().tap_spec : ""; }
@@ -105,6 +113,10 @@ class FakeGenerator final : public model::Generator {
   void set_supports_embeddings(bool enabled) { supports_embeddings_ = enabled; }
   void set_embedding_dim(int dim) { embedding_dim_ = dim; }
   void set_num_tap_layers(int layers) { num_tap_layers_ = layers; }
+  void set_matryoshka_dims(std::vector<int> dims) { matryoshka_dims_ = std::move(dims); }
+  void set_embedding_prompt_prefixes(std::map<std::string, std::string> prefixes) {
+    embedding_prompt_prefixes_ = std::move(prefixes);
+  }
   void set_platos_key(std::shared_ptr<const PlatosKey> key);
   void load_platos_key(const std::filesystem::path& safetensors_path,
                        const std::filesystem::path& metadata_json_path = {});
@@ -123,10 +135,14 @@ class FakeGenerator final : public model::Generator {
   int loop_passes_;
   model::LoopCdMode loopcd_mode_ = model::LoopCdMode::Off;
   bool supports_images_ = true;
+  bool supports_audio_ = false;
+  bool is_encoder_only_ = false;
   bool supports_logit_masker_ = true;
   bool supports_embeddings_ = true;
   int embedding_dim_ = 64;
   int num_tap_layers_ = 48;
+  std::vector<int> matryoshka_dims_;
+  std::map<std::string, std::string> embedding_prompt_prefixes_;
   std::shared_ptr<const PlatosKey> platos_key_;
   Responder responder_;
   double token_delay_;

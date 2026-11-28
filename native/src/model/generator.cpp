@@ -15,6 +15,7 @@
 #include "ingine/generator.h"
 #include "ingine/platos_key.h"
 
+#include "backends/embedding_gemma2/eg2_cuda.h"
 #include "backends/qwen38/qwen38_dense_gpu.h"
 #include "backends/qwen4exp/qwen4exp_gpu.h"
 #include "core/arena.h"
@@ -1596,6 +1597,14 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
 #else
       backends::qwen4exp::register_qwen4exp_cuda_backend();
       return BackendRegistry::instance().create(ModelFamily::Qwen4Exp, options);
+#endif
+    }
+    if (family == ModelFamily::EmbeddingGemma2) {
+#if INGINE_TP_SIZE > 1
+      throw std::invalid_argument("embeddinggemma2-cuda does not support INGINE_TP_SIZE > 1");
+#else
+      backends::embedding_gemma2::register_eg2_cuda_backend();
+      return BackendRegistry::instance().create(ModelFamily::EmbeddingGemma2, options);
 #endif
     }
     if (family != ModelFamily::Inkling2) {

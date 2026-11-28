@@ -1,7 +1,7 @@
 # ingine-serve: the server binary. --fake needs only ingine_serve; --engine needs the model (ingine_model).
 add_executable(ingine-serve main.cpp)
 ingine_internal_includes(ingine-serve)
-target_link_libraries(ingine-serve PRIVATE ingine_serve)
+target_link_libraries(ingine-serve PRIVATE ingine_serve ingine_eg2_cpu)
 if(TARGET ingine_model)
   target_link_libraries(ingine-serve PRIVATE ingine_model)
   target_compile_definitions(ingine-serve PRIVATE INGINE_WITH_MODEL=1)

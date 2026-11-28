@@ -356,8 +356,13 @@ std::vector<Delta> merge_deltas(const std::vector<Delta>& deltas) {
 // ---- ChatFormat -----------------------------------------------------------------------------------------------
 
 ChatFormat ChatFormat::load(const std::filesystem::path& model_dir) {
-  auto data = std::make_shared<detail::FormatData>(detail::FormatData{
-      ChatFormatKind::Inkling2, Tokenizer::load(model_dir), JinjaTemplate(read_file(model_dir / "chat_template.jinja"))});
+  Tokenizer loaded_tok = Tokenizer::load(model_dir);
+  const std::filesystem::path tmpl_path = model_dir / "chat_template.jinja";
+  const bool is_gemma_bpe = (loaded_tok.split_mode() == Tokenizer::SplitMode::GemmaBpe);
+  const std::string tmpl_src =
+      (is_gemma_bpe && !std::filesystem::is_regular_file(tmpl_path)) ? std::string{} : read_file(tmpl_path);
+  auto data = std::make_shared<detail::FormatData>(
+      detail::FormatData{ChatFormatKind::Inkling2, std::move(loaded_tok), JinjaTemplate(tmpl_src)});
   const Tokenizer& tok = data->tokenizer;
   if (tok.token_id(MESSAGE_MODEL).has_value()) {
     data->kind = ChatFormatKind::Inkling2;
@@ -391,6 +396,10 @@ ChatFormat ChatFormat::load(const std::filesystem::path& model_dir) {
     data->tool_call = require_id(tok, "<tool_call>");
     data->end_tool_call = require_id(tok, "</tool_call>");
     data->stop_ids = {data->endoftext, data->im_end};
+  } else if (is_gemma_bpe && tok.token_id("<bos>").has_value() && tok.token_id("<eos>").has_value()) {
+    data->kind = ChatFormatKind::EmbeddingGemma2;
+    data->endoftext = require_id(tok, "<eos>");
+    data->stop_ids = {data->endoftext};
   } else {
     throw std::invalid_argument("unsupported chat format in " + model_dir.string());
   }
@@ -439,7 +448,7 @@ std::vector<int32_t> ChatFormat::stop_ids() const {
 }
 
 std::vector<int32_t> ChatFormat::no_thinking_prefill() const {
-  if (data_->kind == ChatFormatKind::Qwen3_5) return {};
+  if (data_->kind != ChatFormatKind::Inkling2) return {};
   return {data_->message_model, data_->content_text};
 }
 
@@ -450,6 +459,9 @@ int32_t ChatFormat::content_thinking_id() const { return data_->content_thinking
 std::string ChatFormat::decode(std::span<const int32_t> ids) const { return data_->tokenizer.decode_lossy(ids); }
 
 RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const ChatOptions& options) const {
+  if (data_->kind == ChatFormatKind::EmbeddingGemma2) {
+    throw ChatError("embedding_gemma2 is an embeddings-only encoder; use POST /v1/embeddings", "model");
+  }
   const auto t0 = std::chrono::steady_clock::now();
   Json msgs = normalize_messages(messages);
   if (!tools.is_null() && !tools.is_array()) throw ChatError("'tools' must be a list", "tools");
@@ -585,6 +597,10 @@ RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const
 }
 
 RenderedPrompt ChatFormat::render_system_prefix(std::string_view system_prompt, const ChatOptions& options) const {
+  if (data_->kind == ChatFormatKind::EmbeddingGemma2) {
+    throw ChatError("embedding_gemma2 is an embeddings-only encoder and does not support warm-start chat prompts",
+                    "warm_start_prompt");
+  }
   if (system_prompt.find_first_not_of(" \t\r\n") == std::string_view::npos) {
     throw ChatError("warm-start system prompt must contain non-whitespace text", "warm_start_prompt");
   }

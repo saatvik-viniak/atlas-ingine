@@ -480,13 +480,37 @@ model::EmbeddingResult FakeGenerator::embed(const model::EmbeddingRequest& req) 
   std::vector<float> final_flat;
   double pk_seconds = 0.0;
   if (req.use_platos_key) {
+    if (req.dimensions.has_value()) {
+      throw std::invalid_argument("embed: 'dimensions' cannot be combined with 'platos_key'");
+    }
     const auto tp0 = std::chrono::steady_clock::now();
     out_dim = pk->out_dim();
     final_flat.resize(static_cast<std::size_t>(B) * static_cast<std::size_t>(out_dim));
     pk->project_cpu(pooled.data(), B, final_flat.data(), req.normalize);
     pk_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
   } else {
-    final_flat = std::move(pooled);
+    if (req.dimensions.has_value()) {
+      const int d = *req.dimensions;
+      if (d <= 0 || d > H) {
+        throw std::invalid_argument("embed: dimensions " + std::to_string(d) + " out of range [1, " +
+                                    std::to_string(H) + "]");
+      }
+      if (!matryoshka_dims_.empty() &&
+          std::find(matryoshka_dims_.begin(), matryoshka_dims_.end(), d) == matryoshka_dims_.end()) {
+        throw std::invalid_argument("embed: dimensions " + std::to_string(d) + " not in matryoshka_dims");
+      }
+      out_dim = d;
+    }
+    if (out_dim == H) {
+      final_flat = std::move(pooled);
+    } else {
+      final_flat.resize(static_cast<std::size_t>(B) * static_cast<std::size_t>(out_dim));
+      for (int b = 0; b < B; ++b) {
+        std::memcpy(final_flat.data() + static_cast<std::size_t>(b) * static_cast<std::size_t>(out_dim),
+                    pooled.data() + static_cast<std::size_t>(b) * static_cast<std::size_t>(H),
+                    static_cast<std::size_t>(out_dim) * sizeof(float));
+      }
+    }
     if (req.normalize) l2_normalize_rows_cpu(final_flat.data(), B, out_dim);
   }
 
@@ -507,7 +531,8 @@ model::EmbeddingResult FakeGenerator::embed(const model::EmbeddingRequest& req) 
   {
     std::lock_guard lock(mutex_);
     embedding_calls_.push_back(EmbeddingCall{req.inputs, req.pooling, req.normalize, req.tap_layer, req.use_platos_key,
-                                             res.stats.kv_slots_allocated, res.stats.lm_head_skipped});
+                                             req.dimensions, req.prompt_name, res.stats.kv_slots_allocated,
+                                             res.stats.lm_head_skipped});
   }
   return res;
 }

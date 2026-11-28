@@ -616,40 +616,66 @@ std::string dump(const Json& value) { return value.dump(-1, ' ', false, Json::er
 
 ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
                                                int num_tap_layers, bool has_platos_key) {
-  ParsedEmbeddingRequest out = parse_embedding_request(body, fmt, max_model_len, num_tap_layers, nullptr);
-  if (out.request.use_platos_key && !has_platos_key) {
-    throw BadRequest("'platos_key' requested but server was started without --platos-key", "platos_key");
-  }
-  return out;
+  EmbeddingParseOptions opts;
+  opts.max_model_len = max_model_len;
+  opts.num_tap_layers = num_tap_layers;
+  opts.has_platos_key = has_platos_key;
+  return parse_embedding_request(body, fmt, opts);
 }
 
 ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
                                                int num_tap_layers, const PlatosKey* loaded_platos_key) {
+  EmbeddingParseOptions opts;
+  opts.max_model_len = max_model_len;
+  opts.num_tap_layers = num_tap_layers;
+  opts.has_platos_key = (loaded_platos_key != nullptr);
+  opts.loaded_platos_key = loaded_platos_key;
+  return parse_embedding_request(body, fmt, opts);
+}
+
+ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt,
+                                               const EmbeddingParseOptions& opts) {
   ParsedEmbeddingRequest out;
 
   if (const Json* m = get(body, "model")) {
     if (!m->is_string()) throw BadRequest("'model' must be a string", "model");
   }
 
+  std::string prompt_prefix;
+  if (const Json* pn = get(body, "prompt_name")) {
+    if (!pn->is_string()) throw BadRequest("'prompt_name' must be a string", "prompt_name");
+    const std::string& name = pn->get_ref<const std::string&>();
+    if (name.empty()) throw BadRequest("'prompt_name' must not be empty", "prompt_name");
+    const auto it = opts.prompt_prefixes.find(name);
+    if (it == opts.prompt_prefixes.end()) {
+      throw BadRequest("unknown 'prompt_name': '" + name + "'", "prompt_name");
+    }
+    prompt_prefix = it->second;
+    out.request.prompt_name = name;
+  }
+
   const Json* inp = get(body, "input");
   if (!inp) throw BadRequest("'input' is required", "input");
 
+  const bool wrap_bos_eos = (fmt.kind() == text::ChatFormatKind::EmbeddingGemma2);
   auto encode_one = [&](const std::string& text, const char* where_desc) {
     if (text.empty()) {
       throw BadRequest(std::string(where_desc) + " must not be empty", "input");
     }
+    const std::string full_text = prompt_prefix.empty() ? text : (prompt_prefix + text);
     std::vector<int32_t> ids;
     try {
-      ids = fmt.tokenizer().encode(text, /*special=*/false);
+      ids = wrap_bos_eos ? fmt.tokenizer().encode_with_post_processor(full_text, /*special=*/false)
+                         : fmt.tokenizer().encode(full_text, /*special=*/false);
     } catch (const std::invalid_argument& e) {
       throw BadRequest(std::string("failed to tokenize 'input': ") + e.what(), "input");
     }
     if (ids.empty()) {
       throw BadRequest(std::string(where_desc) + " tokenized to 0 tokens", "input");
     }
-    if (static_cast<int>(ids.size()) > max_model_len) {
+    if (static_cast<int>(ids.size()) > opts.max_model_len) {
       throw BadRequest("input has " + std::to_string(ids.size()) + " tokens; the model context is " +
-                           std::to_string(max_model_len),
+                           std::to_string(opts.max_model_len),
                        "input");
     }
     out.request.inputs.push_back(std::move(ids));
@@ -698,11 +724,11 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
   }
 
   if (const auto tap = num_int(body, "tap_layer")) {
-    if (num_tap_layers <= 0) {
+    if (opts.num_tap_layers <= 0) {
       throw BadRequest("'tap_layer' is not supported by this model backend", "tap_layer");
     }
-    if (*tap < 0 || *tap >= num_tap_layers) {
-      throw BadRequest("'tap_layer' must be in [0, " + std::to_string(num_tap_layers - 1) + "]", "tap_layer");
+    if (*tap < 0 || *tap >= opts.num_tap_layers) {
+      throw BadRequest("'tap_layer' must be in [0, " + std::to_string(opts.num_tap_layers - 1) + "]", "tap_layer");
     }
     out.request.tap_layer = static_cast<int>(*tap);
   }
@@ -724,6 +750,9 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
   if (const Json* pk = get(body, "platos_key")) {
     if (!pk->is_boolean()) throw BadRequest("'platos_key' must be a boolean", "platos_key");
     out.request.use_platos_key = pk->get<bool>();
+    if (out.request.use_platos_key && !opts.has_platos_key) {
+      throw BadRequest("'platos_key' requested but server was started without --platos-key", "platos_key");
+    }
   }
 
   if (!out.request.use_platos_key &&
@@ -732,20 +761,46 @@ ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::Cha
                      out.request.cartridge_sha256.has_value() ? "cartridge_sha256" : "cartridge_id");
   }
 
-  if (out.request.use_platos_key && loaded_platos_key != nullptr) {
+  if (out.request.use_platos_key && opts.loaded_platos_key != nullptr) {
     try {
-      loaded_platos_key->validate_request_tap(out.request.tap_layer);
+      opts.loaded_platos_key->validate_request_tap(out.request.tap_layer);
     } catch (const std::invalid_argument& e) {
       throw BadRequest(e.what(), "tap_layer");
     }
     try {
-      loaded_platos_key->validate_request_identity(out.request.cartridge_id.value_or(""),
-                                                   out.request.cartridge_sha256.value_or(""));
+      opts.loaded_platos_key->validate_request_identity(out.request.cartridge_id.value_or(""),
+                                                        out.request.cartridge_sha256.value_or(""));
     } catch (const std::invalid_argument& e) {
       const std::string_view msg(e.what());
       const char* param = (msg.find("cartridge_id") != std::string_view::npos) ? "cartridge_id" : "cartridge_sha256";
       throw BadRequest(e.what(), param);
     }
+  }
+
+  if (const auto dims = num_int(body, "dimensions")) {
+    if (*dims <= 0) {
+      throw BadRequest("'dimensions' must be a positive integer", "dimensions");
+    }
+    if (out.request.use_platos_key) {
+      throw BadRequest("'dimensions' cannot be combined with 'platos_key'", "dimensions");
+    }
+    const int d = static_cast<int>(*dims);
+    if (!opts.matryoshka_dims.empty()) {
+      if (!out.request.tap_layer.has_value() &&
+          std::find(opts.matryoshka_dims.begin(), opts.matryoshka_dims.end(), d) == opts.matryoshka_dims.end()) {
+        std::string allowed;
+        for (std::size_t i = 0; i < opts.matryoshka_dims.size(); ++i) {
+          if (i) allowed += ", ";
+          allowed += std::to_string(opts.matryoshka_dims[i]);
+        }
+        throw BadRequest("'dimensions' must be one of [" + allowed + "]", "dimensions");
+      }
+    } else if (opts.embedding_dim > 0 && d != opts.embedding_dim) {
+      throw BadRequest("'dimensions' truncation is not supported by this model (native dim is " +
+                           std::to_string(opts.embedding_dim) + ")",
+                       "dimensions");
+    }
+    out.request.dimensions = d;
   }
 
   return out;

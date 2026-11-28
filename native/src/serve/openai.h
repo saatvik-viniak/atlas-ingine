@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -86,10 +87,22 @@ struct ParsedEmbeddingRequest {
   EmbeddingEncodingFormat encoding_format = EmbeddingEncodingFormat::Float;
 };
 
-// Validates and tokenizes a POST /v1/embeddings request body (standard OpenAI + opt-in Atlas extensions).
-// Throws BadRequest (HTTP 400) on invalid input, encoding_format, pooling, normalize, tap_layer, platos_key,
-// cartridge_id, or cartridge_sha256. When `loaded_platos_key` is non-null, enforces its bound tap_layer/tap_spec
-// and cartridge identity fail-closed whenever `platos_key=true`.
+struct EmbeddingParseOptions {
+  int max_model_len = 0;
+  int embedding_dim = 0;
+  int num_tap_layers = 0;
+  bool has_platos_key = false;
+  const PlatosKey* loaded_platos_key = nullptr;
+  std::vector<int> matryoshka_dims;
+  std::map<std::string, std::string> prompt_prefixes;
+};
+
+// Validates and tokenizes a POST /v1/embeddings request body (standard OpenAI + Matryoshka dimensions +
+// optional task prompt_name + opt-in Atlas extensions). Throws BadRequest (HTTP 400) on invalid parameters.
+// When `opts.loaded_platos_key` is non-null, enforces its bound tap_layer/tap_spec and cartridge identity
+// fail-closed whenever `platos_key=true`.
+ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt,
+                                               const EmbeddingParseOptions& opts);
 ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
                                                int num_tap_layers, const PlatosKey* loaded_platos_key);
 ParsedEmbeddingRequest parse_embedding_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,

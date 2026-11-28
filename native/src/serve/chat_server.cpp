@@ -181,9 +181,13 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
       loop_passes_(generator.loop_passes()),
       loopcd_mode_(generator.loopcd_mode()),
       supports_logit_masker_(generator.supports_logit_masker()),
+      supports_audio_(generator.supports_audio()),
+      is_encoder_only_(generator.is_encoder_only()),
       supports_embeddings_(generator.supports_embeddings()),
       embedding_dim_(generator.embedding_dim()),
       num_tap_layers_(generator.num_tap_layers()),
+      matryoshka_dims_(generator.matryoshka_dims()),
+      embedding_prompt_prefixes_(generator.embedding_prompt_prefixes()),
       has_platos_key_(generator.has_platos_key()),
       platos_key_out_dim_(generator.platos_key_out_dim()),
       platos_key_tap_spec_(generator.platos_key_tap_spec()),
@@ -259,6 +263,9 @@ Json ChatServer::supported_kv_cache_modes_json() const {
 }
 
 Json ChatServer::model_card() const {
+  Json modalities = Json::array({"text"});
+  if (image_options_.enabled) modalities.push_back("image");
+  if (supports_audio_) modalities.push_back("audio");
   Json card{{"id", model_id_},
             {"object", "model"},
             {"created", created_},
@@ -276,7 +283,14 @@ Json ChatServer::model_card() const {
             {"num_tap_layers", num_tap_layers_},
             {"platos_key_loaded", has_platos_key_},
             {"platos_key_out_dim", platos_key_out_dim_},
-            {"input_modalities", image_options_.enabled ? Json::array({"text", "image"}) : Json::array({"text"})}};
+            {"input_modalities", std::move(modalities)}};
+  if (is_encoder_only_) card["encoder_only"] = true;
+  if (!matryoshka_dims_.empty()) card["matryoshka_dims"] = matryoshka_dims_;
+  if (!embedding_prompt_prefixes_.empty()) {
+    Json pnames = Json::array();
+    for (const auto& [k, _] : embedding_prompt_prefixes_) pnames.push_back(k);
+    card["supported_prompt_names"] = std::move(pnames);
+  }
   if (!platos_key_tap_spec_.empty()) card["platos_key_tap_spec"] = platos_key_tap_spec_;
   if (platos_key_) {
     const auto& pm = platos_key_->metadata();
@@ -346,6 +360,8 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
                 {"embed_running", st.embed_running},
                 {"max_batch", st.max_batch},
                 {"max_queue", st.max_queue}};
+    if (is_encoder_only_) health["encoder_only"] = true;
+    if (!matryoshka_dims_.empty()) health["matryoshka_dims"] = matryoshka_dims_;
     if (!platos_key_tap_spec_.empty()) health["platos_key_tap_spec"] = platos_key_tap_spec_;
     if (platos_key_) {
       const auto& pm = platos_key_->metadata();
@@ -407,10 +423,15 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
         return;
       }
       if (!body.is_object()) throw BadRequest("request body must be a JSON object");
-      emb_req = parse_embedding_request(body, fmt_, max_model_len_, num_tap_layers_, platos_key_.get());
-      if (emb_req.request.use_platos_key && !has_platos_key_) {
-        throw BadRequest("'platos_key' requested but server was started without --platos-key", "platos_key");
-      }
+      EmbeddingParseOptions popts;
+      popts.max_model_len = max_model_len_;
+      popts.embedding_dim = embedding_dim_;
+      popts.num_tap_layers = num_tap_layers_;
+      popts.has_platos_key = has_platos_key_;
+      popts.loaded_platos_key = platos_key_.get();
+      popts.matryoshka_dims = matryoshka_dims_;
+      popts.prompt_prefixes = embedding_prompt_prefixes_;
+      emb_req = parse_embedding_request(body, fmt_, popts);
     } catch (const BadRequest& e) {
       send_error(res, e.status, e.what(), e.param);
       return;
@@ -419,6 +440,10 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
       return;
     }
     complete_embedding(req, res, std::move(emb_req));
+    return;
+  }
+  if (is_encoder_only_) {
+    fail_post(400, "model '" + model_id_ + "' is an embeddings-only encoder; use POST /v1/embeddings", "model");
     return;
   }
   if (req.has_header("X-Ingine-Expected-Loop-Passes")) {
@@ -874,6 +899,7 @@ void ChatServer::complete_embedding(const httplib::Request& req, httplib::Respon
 
   res.set_header("X-Ingine-Kv-Slots-Allocated", std::to_string(result.stats.kv_slots_allocated));
   res.set_header("X-Ingine-Lm-Head-Skipped", result.stats.lm_head_skipped ? "true" : "false");
+  res.set_header("X-Ingine-Embedding-Dim", std::to_string(result.stats.output_dim));
   res.set_header("X-Ingine-Tap-Layer", result.stats.effective_tap_layer >= 0
                                            ? std::to_string(result.stats.effective_tap_layer)
                                            : "full");

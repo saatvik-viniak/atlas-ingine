@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -230,6 +231,8 @@ struct RuntimeOptions {
   bool prefix_cache = true;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
+  // Audio input: load the audio tower (for multimodal encoders such as EmbeddingGemma 2).
+  bool audio = false;
   // Dynamic 3-tier MoE expert offloading (atlas-6g-homology):
   //   offload_vram_mb == 0: disabled (all experts resident in VRAM).
   //   offload_vram_mb > 0:  target VRAM cap in MiB (e.g. 6144 for 6 GB GPUs); non-expert weights, KV cache,
@@ -318,6 +321,10 @@ struct EmbeddingRequest {
   // Optional #964 cartridge identity pins verified fail-closed against the loaded Plato's Key.
   std::optional<std::string> cartridge_id;
   std::optional<std::string> cartridge_sha256;
+  // Optional Matryoshka output dimension (OpenAI "dimensions"); truncation happens before L2 re-normalization.
+  std::optional<int> dimensions;
+  // Optional named task prefix applied before tokenization (e.g. "SearchQuery", "Document" on EmbeddingGemma 2).
+  std::optional<std::string> prompt_name;
 };
 
 struct EmbeddingStats {
@@ -387,6 +394,8 @@ class Generator {
     throw std::invalid_argument("warm_start is not supported by this generator backend (no prefix cache)");
   }
   virtual bool supports_images() const { return false; }
+  virtual bool supports_audio() const { return false; }
+  virtual bool is_encoder_only() const { return false; }
   virtual bool supports_logit_masker() const { return true; }
   virtual std::string model_family() const { return "inkling2"; }
   virtual KvCacheMode kv_cache_mode() const { return KvCacheMode::PerPass; }
@@ -404,6 +413,8 @@ class Generator {
   virtual bool supports_embeddings() const { return false; }
   virtual int embedding_dim() const { return 0; }
   virtual int num_tap_layers() const { return 0; }
+  virtual std::vector<int> matryoshka_dims() const { return {}; }
+  virtual std::map<std::string, std::string> embedding_prompt_prefixes() const { return {}; }
   virtual bool has_platos_key() const { return false; }
   virtual int platos_key_out_dim() const { return 0; }
   virtual std::string platos_key_tap_spec() const { return {}; }
