@@ -371,6 +371,8 @@ ingine::model::EmbeddingResult Eg2CpuEncoder::embed(const ingine::model::Embeddi
     if (req.dimensions.has_value()) {
       throw std::invalid_argument("EmbeddingGemma2: 'dimensions' cannot be combined with 'platos_key'");
     }
+    platos_key->validate_request_tap(req.tap_layer);
+    platos_key->validate_request_identity(req.cartridge_id.value_or(""), req.cartridge_sha256.value_or(""));
     if (platos_key->in_dim() != cur_dim) {
       throw std::invalid_argument("EmbeddingGemma2: platos_key d_in (" + std::to_string(platos_key->in_dim()) +
                                   ") does not match embedding input dim (" + std::to_string(cur_dim) + ")");
@@ -428,6 +430,16 @@ Eg2CpuBackend::Eg2CpuBackend(const ingine::model::RuntimeOptions& options)
   }
   if (!options.platos_key.empty()) {
     platos_key_ = PlatosKey::load(options.platos_key, options.platos_key_metadata, 0);
+    const Eg2Config& cfg = encoder_.config();
+    const int expected_dim = platos_key_->metadata().expected_tap_layer.has_value()
+                                 ? cfg.hidden_size
+                                 : (platos_key_->metadata().requires_final_layer ? cfg.embedding_dim : 0);
+    if (expected_dim == 0 && platos_key_->in_dim() != cfg.hidden_size && platos_key_->in_dim() != cfg.embedding_dim) {
+      throw std::invalid_argument("EmbeddingGemma2: platos_key d_in (" + std::to_string(platos_key_->in_dim()) +
+                                  ") matches neither hidden_size (" + std::to_string(cfg.hidden_size) +
+                                  ") nor embedding_dim (" + std::to_string(cfg.embedding_dim) + ")");
+    }
+    platos_key_->validate_binding(model_id_, model_family(), expected_dim, cfg.num_hidden_layers);
   }
   init_metadata();
 }
