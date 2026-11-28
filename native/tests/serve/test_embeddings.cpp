@@ -734,6 +734,58 @@ void test_cartridge_964_binding_and_layouts_fail_closed() {
       threw_donor_dup = true;
     }
     CHECK(threw_donor_dup);
+
+    // Rev6 regressions: out-of-range signed/unsigned JSON integers MUST NOT narrow mod 2^32 to valid tap/dims!
+    const auto expect_json_reject = [&](const std::string& raw_json) {
+      bool threw = false;
+      try {
+        (void)PlatosKey::load_with_json(p_a, raw_json, D_IN);
+      } catch (const std::invalid_argument&) {
+        threw = true;
+      }
+      CHECK(threw);
+    };
+    // Positive unsigned wraparound: (1ULL << 32) + 41 == 4294967337 wraps to int(41) under unchecked static_cast!
+    expect_json_reject(Json{{"cartridge_sha256", sha_a},
+                            {"donor_model_id", "thinkingmachines/Inkling-2-Mini"},
+                            {"d_donor", D_IN},
+                            {"d_target", D_OUT},
+                            {"tap_spec", "visit_41"},
+                            {"tap_layer", static_cast<std::uint64_t>((1ULL << 32) + 41ULL)}}
+                           .dump());
+    // Negative signed wraparound: -(1LL << 32) + 41 == -4294967255 wraps to int(41) under unchecked static_cast!
+    expect_json_reject(Json{{"cartridge_sha256", sha_a},
+                            {"donor_model_id", "thinkingmachines/Inkling-2-Mini"},
+                            {"d_donor", D_IN},
+                            {"d_target", D_OUT},
+                            {"tap_spec", "visit_41"},
+                            {"tap_layer", static_cast<std::int64_t>(-(1LL << 32) + 41LL)}}
+                           .dump());
+    // Dimension wraparound in both directions: (1ULL << 32) + D_IN and -(1LL << 32) + D_OUT!
+    expect_json_reject(Json{{"cartridge_sha256", sha_a},
+                            {"d_donor", static_cast<std::uint64_t>((1ULL << 32) + static_cast<std::uint64_t>(D_IN))},
+                            {"d_target", D_OUT},
+                            {"tap_spec", "visit_41"},
+                            {"tap_layer", 41}}
+                           .dump());
+    expect_json_reject(Json{{"cartridge_sha256", sha_a},
+                            {"d_donor", D_IN},
+                            {"d_target", static_cast<std::int64_t>(-(1LL << 32) + static_cast<std::int64_t>(D_OUT))},
+                            {"tap_spec", "visit_41"},
+                            {"tap_layer", 41}}
+                           .dump());
+    // Ordinary valid in-range integer binding succeeds cleanly.
+    const auto k_valid_int = PlatosKey::load_with_json(
+        p_a,
+        Json{{"cartridge_sha256", sha_a},
+             {"donor_model_id", "thinkingmachines/Inkling-2-Mini"},
+             {"d_donor", D_IN},
+             {"d_target", D_OUT},
+             {"tap_spec", "visit_41"},
+             {"tap_layer", 41}}
+            .dump(),
+        D_IN);
+    CHECK(k_valid_int->metadata().expected_tap_layer == std::optional<int>{41});
   }
 
   // 4) Final-layer bound key (`tap_spec: "final_normed"`): accepts omitted tap_layer, rejects explicit tap_layer!

@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -120,7 +121,18 @@ ParsedSafetensorsBuffer read_and_parse_safetensors_once(const std::filesystem::p
     const auto& sh = v["shape"];
     if (!sh.is_array()) throw std::invalid_argument("platos_key: shape must be array for '" + k + "'");
     for (const auto& d : sh) {
-      const std::int64_t dv = d.get<std::int64_t>();
+      std::int64_t dv = -1;
+      if (d.is_number_unsigned()) {
+        const auto u = d.get<std::uint64_t>();
+        if (u > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+          throw std::invalid_argument("platos_key: dim overflow in shape for '" + k + "'");
+        }
+        dv = static_cast<std::int64_t>(u);
+      } else if (d.is_number_integer() && !d.is_boolean()) {
+        dv = d.get<std::int64_t>();
+      } else {
+        throw std::invalid_argument("platos_key: non-integer dim in shape for '" + k + "'");
+      }
       if (dv < 0) throw std::invalid_argument("platos_key: negative dim in shape for '" + k + "'");
       td.shape.push_back(dv);
     }
@@ -428,13 +440,30 @@ SidecarDeclaredFields merge_and_validate_json_metadata(std::string_view json_tex
   meta.json_metadata = std::string(json_text);
 
   auto parse_json_int = [&](const nlohmann::ordered_json& val, const char* key) -> int {
-    if (val.is_number_integer() && !val.is_boolean()) return val.get<int>();
+    constexpr auto kMaxIntU = static_cast<std::uint64_t>(std::numeric_limits<int>::max());
+    constexpr auto kMaxIntS = static_cast<std::int64_t>(std::numeric_limits<int>::max());
+    if (val.is_number_unsigned()) {
+      const auto u = val.get<std::uint64_t>();
+      if (u > kMaxIntU) {
+        throw std::invalid_argument(std::string("platos_key: metadata JSON '") + key + "' value " +
+                                    std::to_string(u) + " exceeds non-negative int range");
+      }
+      return static_cast<int>(u);
+    }
+    if (val.is_number_integer() && !val.is_boolean()) {
+      const auto s = val.get<std::int64_t>();
+      if (s < 0 || s > kMaxIntS) {
+        throw std::invalid_argument(std::string("platos_key: metadata JSON '") + key + "' value " +
+                                    std::to_string(s) + " is outside non-negative int range");
+      }
+      return static_cast<int>(s);
+    }
     if (val.is_string()) {
       const auto parsed = parse_strict_nonneg_int(val.get_ref<const std::string&>());
       if (parsed.has_value()) return *parsed;
       throw std::invalid_argument(std::string("platos_key: metadata JSON '") + key + "' is not a valid non-negative integer");
     }
-    throw std::invalid_argument(std::string("platos_key: metadata JSON '") + key + "' must be an integer");
+    throw std::invalid_argument(std::string("platos_key: metadata JSON '") + key + "' must be a non-negative integer");
   };
 
   auto check_dim = [&](const char* key, int actual) {
