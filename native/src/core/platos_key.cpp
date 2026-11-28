@@ -208,12 +208,18 @@ std::optional<int> parse_strict_nonneg_int(std::string_view s) noexcept {
   return v;
 }
 
-// Parses unambiguous single-tap specs ("layer_31", "visit_41") and classifies final/multi-tap specs.
+// Parses unambiguous single-tap specs ("layer_31", "visit_41"), final-layer specs ("final_normed", "final"),
+// documented unbound single-tap ("single_tap"), and multi-tap concat specs. Preserves legacy unbound behavior
+// when tap_spec is empty; rejects any unrecognized nonempty tap_spec (e.g. "visit41") fail-closed.
 void parse_and_validate_tap_binding(PlatosKeyMetadata& meta, std::optional<int> explicit_tap_layer) {
   const std::string spec_l = to_lower_ascii(meta.tap_spec);
   std::optional<int> spec_tap;
-  if (spec_l == "final_normed" || spec_l == "final") {
+  if (spec_l.empty()) {
+    // Legacy unbound key with no declared tap_spec.
+  } else if (spec_l == "final_normed" || spec_l == "final") {
     meta.requires_final_layer = true;
+  } else if (spec_l == "single_tap") {
+    // Documented #964 catalog single-tap spec without an encoded layer index (e.g. ling32_h3_single_tap_25m).
   } else if (spec_l.find("concat") != std::string::npos) {
     meta.is_multi_tap = true;
   } else if (spec_l.rfind("layer_", 0) == 0) {
@@ -226,6 +232,9 @@ void parse_and_validate_tap_binding(PlatosKeyMetadata& meta, std::optional<int> 
     if (!spec_tap.has_value()) {
       throw std::invalid_argument("platos_key: malformed tap_spec '" + meta.tap_spec + "'");
     }
+  } else {
+    throw std::invalid_argument("platos_key: unsupported tap_spec '" + meta.tap_spec +
+                                "' (expected 'layer_<N>', 'visit_<N>', 'final_normed', 'final', or 'single_tap')");
   }
 
   if (explicit_tap_layer.has_value()) {
@@ -250,38 +259,34 @@ void parse_and_validate_tap_binding(PlatosKeyMetadata& meta, std::optional<int> 
   }
 }
 
-// Canonicalizes a model identifier string to a known family tag when recognizable, else returns empty.
-std::string infer_canonical_family(std::string_view name) {
-  std::string s = to_lower_ascii(name);
-  if (s.find("inkling") != std::string::npos) return "inkling2";
-  if (s.find("qwen3.8") != std::string::npos || s.find("qwen3_8") != std::string::npos ||
-      s.find("qwen38") != std::string::npos || s.find("qwen3.5") != std::string::npos ||
-      s.find("qwen3_5") != std::string::npos || s.find("qwen35") != std::string::npos) {
-    if (s.find("flash-next") != std::string::npos || s.find("flash_next") != std::string::npos) return "qwen4exp";
-    return "qwen3_5";
+// Canonicalizes an explicit checkpoint identifier via documented packaging/runtime aliases only.
+// Strips optional org prefix ("org/repo" -> "repo"), lowercases, strips only exact known quant/packaging/harness
+// suffixes ("-nvfp4", "-fp8", "-bf16", "-fp16", "-int8", "-int4", "-awq", "-gptq", "-gguf", "-ingine", "-fake"),
+// and collapses punctuation ("-", "_", "."). Distinct checkpoints within the same family
+// (e.g. "example/Inkling-2-Different-Checkpoint", "Inkling-2-Mini-abliterated", "Qwen/Qwen3.8-8B") remain distinct.
+std::string canonical_checkpoint_id(std::string_view name) {
+  const std::size_t slash = name.rfind('/');
+  std::string tail = to_lower_ascii((slash == std::string_view::npos) ? name : name.substr(slash + 1));
+  static constexpr std::string_view kPackagingSuffixes[] = {
+      "-nvfp4", "_nvfp4", "-fp8",    "_fp8",    "-bf16", "_bf16", "-fp16",   "_fp16",
+      "-int8",  "_int8",  "-int4",   "_int4",   "-awq",  "_awq",  "-gptq",   "_gptq",
+      "-gguf",  "_gguf",  "-ingine", "_ingine", "-fake", "_fake",
+  };
+  bool stripped = true;
+  while (stripped) {
+    stripped = false;
+    for (std::string_view suf : kPackagingSuffixes) {
+      if (tail.size() > suf.size() && std::string_view(tail).substr(tail.size() - suf.size()) == suf) {
+        tail.resize(tail.size() - suf.size());
+        stripped = true;
+        break;
+      }
+    }
   }
-  if (s.find("qwen4exp") != std::string::npos || s.find("qwen4_exp") != std::string::npos) return "qwen4exp";
-  if (s.find("embeddinggemma") != std::string::npos || s.find("embedding_gemma") != std::string::npos) {
-    return "embedding_gemma2";
-  }
-  if (s.find("deepseek") != std::string::npos) return "deepseek_v4";
-  if (s.find("glm") != std::string::npos) return "glm_flash";
-  if (s.find("ling-3") != std::string::npos || s.find("ling_3") != std::string::npos ||
-      s.find("ling32") != std::string::npos) {
-    return "ling32";
-  }
-  return {};
-}
-
-std::string normalize_model_stem(std::string_view name) {
-  std::size_t slash = name.rfind('/');
-  std::string_view tail = (slash == std::string_view::npos) ? name : name.substr(slash + 1);
   std::string out;
   out.reserve(tail.size());
   for (char c : tail) {
-    if (std::isalnum(static_cast<unsigned char>(c))) {
-      out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-    }
+    if (std::isalnum(static_cast<unsigned char>(c))) out.push_back(c);
   }
   return out;
 }
@@ -562,6 +567,16 @@ std::shared_ptr<const PlatosKey> PlatosKey::load_with_json(const std::filesystem
   key->meta_.cartridge_id = meta_get_first(key->meta_.raw_metadata, {"cartridge_id"});
   key->meta_.donor_model =
       meta_get_first(key->meta_.raw_metadata, {"donor_model_id", "donor_model", "source_model", "model_id"});
+  // If both embedded safetensors metadata and sidecar JSON declare a donor checkpoint, require agreement.
+  const std::string emb_donor = meta_get_first(buf.metadata, {"donor_model_id", "donor_model", "source_model", "model_id"});
+  if (!emb_donor.empty() && !key->meta_.donor_model.empty()) {
+    const std::string emb_ckpt = canonical_checkpoint_id(emb_donor);
+    const std::string merged_ckpt = canonical_checkpoint_id(key->meta_.donor_model);
+    if (emb_ckpt != merged_ckpt) {
+      throw std::invalid_argument("platos_key: sidecar donor_model_id '" + key->meta_.donor_model +
+                                  "' contradicts embedded donor_model '" + emb_donor + "'");
+    }
+  }
   key->meta_.target_model = meta_get_first(key->meta_.raw_metadata, {"target_model"});
   key->meta_.tap_spec = meta_get_first(key->meta_.raw_metadata, {"tap_spec", "target_tap"});
   key->meta_.method = meta_get_first(key->meta_.raw_metadata, {"method", "solver"});
@@ -602,6 +617,7 @@ std::shared_ptr<const PlatosKey> PlatosKey::load_with_json(const std::filesystem
 
 void PlatosKey::validate_binding(std::string_view active_model_id, std::string_view active_model_family,
                                  int active_embedding_dim, int active_num_tap_layers) const {
+  (void)active_model_family;
   if (meta_.is_multi_tap) {
     throw std::invalid_argument("platos_key: multi-tap concat spec '" + meta_.tap_spec +
                                 "' is not supported by single-tap /v1/embeddings");
@@ -617,20 +633,12 @@ void PlatosKey::validate_binding(std::string_view active_model_id, std::string_v
     }
   }
   if (!meta_.donor_model.empty()) {
-    const std::string donor_fam = infer_canonical_family(meta_.donor_model);
-    std::string active_fam = infer_canonical_family(active_model_family);
-    if (active_fam.empty()) active_fam = infer_canonical_family(active_model_id);
-    if (!donor_fam.empty() || !active_fam.empty()) {
-      if (donor_fam != active_fam) {
-        throw std::invalid_argument("platos_key: donor_model mismatch (key binds '" + meta_.donor_model +
-                                    "', active runtime is model='" + std::string(active_model_id) + "' family='" +
-                                    std::string(active_model_family) + "')");
-      }
-    } else {
-      if (normalize_model_stem(meta_.donor_model) != normalize_model_stem(active_model_id)) {
-        throw std::invalid_argument("platos_key: donor_model mismatch (key binds '" + meta_.donor_model +
-                                    "', active runtime is '" + std::string(active_model_id) + "')");
-      }
+    const std::string donor_ckpt = canonical_checkpoint_id(meta_.donor_model);
+    const std::string active_ckpt = canonical_checkpoint_id(active_model_id);
+    if (donor_ckpt.empty() || active_ckpt.empty() || donor_ckpt != active_ckpt) {
+      throw std::invalid_argument("platos_key: donor_model mismatch (key binds '" + meta_.donor_model +
+                                  "' [canonical='" + donor_ckpt + "'], active runtime is model='" +
+                                  std::string(active_model_id) + "' [canonical='" + active_ckpt + "'])");
     }
   }
 }

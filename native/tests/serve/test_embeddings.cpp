@@ -190,7 +190,7 @@ std::unique_ptr<Served> make_served(int max_model_len = 1024, int max_queue = 8,
                                     const std::filesystem::path& pk_path = {},
                                     const std::filesystem::path& pk_meta = {}, bool enable_embeddings = true) {
   auto s = std::make_unique<Served>();
-  s->gen = std::make_unique<FakeGenerator>(g_fmt->tokenizer(), "inkling-embed-test", max_model_len);
+  s->gen = std::make_unique<FakeGenerator>(g_fmt->tokenizer(), "Inkling-2-Mini-fake", max_model_len);
   s->gen->set_supports_embeddings(enable_embeddings);
   s->gen->set_embedding_dim(64);
   s->gen->set_num_tap_layers(48);
@@ -328,7 +328,7 @@ void test_openai_schema_batch_and_base64() {
 
   const Json j_single = Json::parse(r_single.body);
   CHECK(j_single["object"] == "list");
-  CHECK(j_single["model"] == "inkling-embed-test");
+  CHECK(j_single["model"] == "Inkling-2-Mini-fake");
   CHECK(j_single["data"].is_array() && j_single["data"].size() == 1);
   CHECK(j_single["data"][0]["object"] == "embedding");
   CHECK(j_single["data"][0]["index"] == 0);
@@ -533,8 +533,10 @@ void test_cartridge_964_binding_and_layouts_fail_closed() {
   }
   CHECK(threw_wrong_artifact);
 
-  // 2) Mismatched donor_model_id: Qwen3.8 or Ling-3.2 key loaded onto Inkling runtime -> fail-closed!
-  for (const std::string& bad_donor : {"Qwen/Qwen3.8-27B", "inclusionAI/Ling-3.2-air", "OtherModel-7B"}) {
+  // 2) Mismatched donor_model_id (both cross-family AND distinct same-family checkpoints) -> fail-closed!
+  for (const std::string& bad_donor :
+       {"Qwen/Qwen3.8-27B", "inclusionAI/Ling-3.2-air", "OtherModel-7B",
+        "example/Inkling-2-Different-Checkpoint", "thinkingmachines/Inkling-2-Mini-abliterated"}) {
     const auto m_bad_donor = tmp / "bad_donor.json";
     {
       std::ofstream mf(m_bad_donor);
@@ -542,8 +544,8 @@ void test_cartridge_964_binding_and_layouts_fail_closed() {
                  {"donor_model_id", bad_donor},
                  {"d_donor", D_IN},
                  {"d_target", D_OUT},
-                 {"tap_spec", "layer_31"},
-                 {"tap_layer", 31}}
+                 {"tap_spec", "visit_41"},
+                 {"tap_layer", 41}}
                 .dump();
     }
     bool threw_donor = false;
@@ -555,7 +557,7 @@ void test_cartridge_964_binding_and_layouts_fail_closed() {
     CHECK(threw_donor);
   }
 
-  // 3) Conflicting tap_spec vs tap_layer in sidecar -> fail-closed at load!
+  // 3) Conflicting tap_spec vs tap_layer AND unrecognized nonempty tap_spec ("visit41") -> fail-closed at load!
   {
     const auto m_bad_tap = tmp / "bad_tap.json";
     std::ofstream mf(m_bad_tap);
@@ -568,6 +570,31 @@ void test_cartridge_964_binding_and_layouts_fail_closed() {
       threw_conflict = true;
     }
     CHECK(threw_conflict);
+
+    for (const std::string& bad_spec : {"visit41", "layer-31", "mid_block", "slot0"}) {
+      const auto m_unk_tap = tmp / "unk_tap.json";
+      std::ofstream uf(m_unk_tap);
+      uf << Json{{"cartridge_sha256", sha_a},
+                 {"donor_model_id", "thinkingmachines/Inkling-2-Mini"},
+                 {"d_donor", D_IN},
+                 {"d_target", D_OUT},
+                 {"tap_spec", bad_spec}}
+                .dump();
+      uf.close();
+      bool threw_unk_spec = false;
+      try {
+        (void)PlatosKey::load(p_a, m_unk_tap, D_IN);
+      } catch (const std::invalid_argument&) {
+        threw_unk_spec = true;
+      }
+      CHECK(threw_unk_spec);
+    }
+
+    // Legacy unbound key (no tap_spec, no tap_layer, no donor_model) remains supported.
+    auto s_legacy = make_served(1024, 8, p_a, {});
+    const Response r_leg = http_req(s_legacy->port(), "POST", "/v1/embeddings",
+                                    Json{{"input", "hello"}, {"platos_key", true}}.dump());
+    CHECK(r_leg.status == 200);
   }
 
   // 4) Final-layer bound key (`tap_spec: "final_normed"`): accepts omitted tap_layer, rejects explicit tap_layer!
